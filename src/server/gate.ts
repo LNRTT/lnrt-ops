@@ -4,6 +4,8 @@ export type OpsEnv = {
   OPS_ADMIN_EMAILS?: string;
   OPS_PASSWORD_HASH?: string;
   OPS_SECRET?: string;
+  /** Set to "1" to log the shape of a rejected sign-in. Never logs the value. */
+  OPS_DEBUG_LOGIN?: string;
 };
 
 // Cost-10 hash of a value nobody knows. Compared against when the supplied email
@@ -73,8 +75,45 @@ export async function verifyCredentials(
   const hash = allowed ? readEnv(env).OPS_PASSWORD_HASH! : DECOY_HASH;
   try {
     const matched = await bcrypt.compare(password, hash);
+    if (!(allowed && matched)) await describeRejection(email, password, hash, allowed, env);
     return allowed && matched;
   } catch {
     return false;
   }
+}
+
+/**
+ * Temporary diagnostic, off unless OPS_DEBUG_LOGIN=1.
+ *
+ * When an operator insists they typed the right password, the useful question
+ * is what actually arrived — a password manager overwriting the field, a pasted
+ * trailing space, or a different value entirely. This reports the shape of the
+ * submission and never the submission itself: no password, no hash, no email
+ * beyond whether it was on the allow-list.
+ */
+async function describeRejection(
+  email: string, password: string, hash: string, allowed: boolean, env?: OpsEnv,
+): Promise<void> {
+  if (readEnv(env).OPS_DEBUG_LOGIN !== "1") return;
+  let trimmedWouldMatch = false;
+  try {
+    if (allowed && password.trim() !== password) {
+      trimmedWouldMatch = await bcrypt.compare(password.trim(), hash);
+    }
+  } catch {
+    // A diagnostic must never change the outcome it is diagnosing.
+  }
+  console.error(
+    "[ops][debug] rejected sign-in:",
+    JSON.stringify({
+      emailOnAllowList: allowed,
+      chars: password.length,
+      bytes: Buffer.byteLength(password, "utf8"),
+      charsAfterTrim: password.trim().length,
+      trimmedWouldMatch,
+      hasNonAscii: /[^\x20-\x7e]/.test(password),
+      firstCharCode: password.charCodeAt(0) || null,
+      lastCharCode: password.charCodeAt(password.length - 1) || null,
+    }),
+  );
 }
