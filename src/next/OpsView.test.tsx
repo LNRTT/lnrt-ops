@@ -199,6 +199,15 @@ test("ignores a flash cookie that is not correctly signed", async () => {
     "an unsigned flash cookie must never be rendered");
 });
 
+test("tells crawlers not to index it, signed in or not", async () => {
+  // The API sends X-Robots-Tag, but this page is rendered by the host's route,
+  // which never applies those headers.
+  for (const [label, cookie] of [["signed out", undefined], ["signed in", authCookie]] as const) {
+    const html = await render(["users"], cookie);
+    assert.match(html, /<meta name="robots" content="noindex, nofollow"\/>/, label);
+  }
+});
+
 test("carries its own stylesheet so it does not depend on host CSS", async () => {
   const html = await render(["users"], authCookie);
   assert.match(html, /<style>/);

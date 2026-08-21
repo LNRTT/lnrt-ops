@@ -31,6 +31,10 @@ function one(v: string | string[] | undefined): string {
 function Shell({ csrf, children }: { csrf: string; children: ReactNode }) {
   return (
     <div className="ops-root">
+      {/* The API sets X-Robots-Tag, but this page is rendered by the host's
+          own route, which never applies those headers — so say it in the
+          markup instead. */}
+      <meta name="robots" content="noindex, nofollow" />
       <style>{OPS_STYLES}</style>
       <div className="ops-shell">
         <nav className="ops-nav">
@@ -60,6 +64,7 @@ export async function OpsView({ ops, path, search, cookieHeader }: OpsViewProps)
   if (!s || !isAllowedEmail(s.email)) {
     return (
       <div className="ops-root">
+        <meta name="robots" content="noindex, nofollow" />
         <style>{OPS_STYLES}</style>
         <Login error={one(search.error) || undefined} />
       </div>

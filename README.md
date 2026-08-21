@@ -146,7 +146,9 @@ other storage layer.
 
 - Rotating `OPS_PASSWORD_HASH` does **not** invalidate outstanding session cookies:
   those are signed with `OPS_SECRET`, not derived from the password hash. A leaked
-  session cookie survives a password change for up to 8 hours (`OPS_TTL_SECONDS`).
+  session cookie survives a password change for up to 8 hours. That lifetime is a
+  constant in the package, not an environment variable — rotate `OPS_SECRET` to revoke
+  outstanding cookies immediately.
   To revoke sessions immediately, rotate `OPS_SECRET` instead — that invalidates
   every outstanding cookie at once, including your own.
 
