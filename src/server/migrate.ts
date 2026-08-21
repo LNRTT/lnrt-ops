@@ -27,6 +27,10 @@ async function appliedIds(client: { query: Pool["query"] }): Promise<Set<string>
 export async function migrate(pool: Pool, migrations: Migration[]): Promise<string[]> {
   const client = await pool.connect();
   const applied: string[] = [];
+  // Set when the client is left in a state the pool must not reuse — e.g. a
+  // ROLLBACK that itself throws (connection dropped mid-error-handling) can leave
+  // the client stuck inside an open transaction.
+  let poisoned: Error | undefined;
   try {
     await client.query("SELECT pg_advisory_lock($1)", [LOCK_KEY]);
     await ensureLedger(client);
@@ -40,14 +44,22 @@ export async function migrate(pool: Pool, migrations: Migration[]): Promise<stri
         await client.query("COMMIT");
         applied.push(m.id);
       } catch (err) {
-        await client.query("ROLLBACK");
+        try {
+          await client.query("ROLLBACK");
+        } catch (rollbackErr) {
+          poisoned = rollbackErr instanceof Error ? rollbackErr : new Error(String(rollbackErr));
+        }
         throw err;
       }
     }
     return applied;
   } finally {
     await client.query("SELECT pg_advisory_unlock($1)", [LOCK_KEY]).catch(() => {});
-    client.release();
+    if (poisoned) {
+      client.release(poisoned);
+    } else {
+      client.release();
+    }
   }
 }
 

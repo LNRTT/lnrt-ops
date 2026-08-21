@@ -1,4 +1,4 @@
-import type { Migration } from "../migrate.ts";
+import type { Migration } from "../migrate";
 
 export const m001Init: Migration = {
   id: "001-init",

@@ -1,7 +1,7 @@
 import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { Pool } from "pg";
-import { migrate, pendingMigrations, type Migration } from "./migrate.ts";
+import { migrate, pendingMigrations, type Migration } from "./migrate";
 
 const URL = process.env.OPS_TEST_DATABASE_URL;
 if (!URL) throw new Error("OPS_TEST_DATABASE_URL is not set — see the plan's Global Constraints");
@@ -50,4 +50,17 @@ test("a failing migration rolls back and leaves it pending", async () => {
   const { rows } = await pool.query(
     "SELECT to_regclass('ops_bad') AS t");
   assert.equal(rows[0].t, null, "the partial DDL must have been rolled back");
+});
+
+test("advisory lock is released after a failing migration, so a later run can still proceed", async () => {
+  await pool.query("DROP TABLE IF EXISTS ops_probe; DELETE FROM ops_migration");
+  const bad: Migration[] = [{ id: "t901", sql: "SELECT nonexistent_fn()" }];
+  await assert.rejects(() => migrate(pool, bad));
+
+  // pg_advisory_lock is session-reentrant: the *same* connection could re-acquire
+  // its own lock even if we never released it, so this only proves anything because
+  // the pool may hand the next call a different connection. It's a regression guard
+  // for the release path, not a proof the lock itself is gone.
+  const applied = await migrate(pool, FIXTURES);
+  assert.deepEqual(applied, ["t001", "t002"]);
 });
