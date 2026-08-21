@@ -84,6 +84,9 @@ test("the login form can reveal the password", async () => {
   assert.match(html, /id="ops-pw-show"/);
   assert.match(html, /Show password/);
   assert.match(html, /field\.type = box\.checked/, "the toggle must actually be wired up");
+  // A password manager must not offer the host app's credential here.
+  assert.equal(/autocomplete="current-password"/i.test(html), false);
+  assert.equal((html.match(/autocomplete="off"/gi) ?? []).length, 2, "both fields opt out");
 });
 
 test("lists users once signed in, marking disabled and password-less accounts", async () => {

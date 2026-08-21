@@ -23,7 +23,14 @@ export function Login({ error }: { error?: string }) {
       {error && <p className="ops-error">Invalid email or password.</p>}
       <form method="post" action="/ops/api/login">
         <p>
-          <input name="email" type="email" placeholder="Email" required style={{ width: "100%" }} />
+          <input
+            name="email"
+            type="email"
+            placeholder="Email"
+            required
+            autoComplete="off"
+            style={{ width: "100%" }}
+          />
         </p>
         <p>
           <input
@@ -32,7 +39,12 @@ export function Login({ error }: { error?: string }) {
             type="password"
             placeholder="Ops password"
             required
-            autoComplete="current-password"
+            // Never "current-password": the ops password shares a domain with
+            // the host application's own login, so a password manager offers
+            // the app's credential here and can overwrite what the operator
+            // typed at submit time — the field looks right and the wrong bytes
+            // are sent.
+            autoComplete="off"
             style={{ width: "100%" }}
           />
         </p>
