@@ -33,4 +33,6 @@ test("cookie is scoped to /ops and locked down", () => {
   assert.equal(a.sameSite, "strict");
   assert.equal(a.path, "/ops");
   assert.equal(a.maxAge, 8 * 3600);
+  assert.equal(a.secure, true, "Secure must be the default, not a NODE_ENV side effect");
+  assert.equal(opsCookieAttrs(60, { secure: false }).secure, false);
 });

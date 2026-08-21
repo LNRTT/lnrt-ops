@@ -11,6 +11,22 @@ export type OpsEnv = {
 // list cannot be probed by timing.
 const DECOY_HASH = "$2b$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy";
 
+// HS256 signing key floor. Shorter keys are brute-forceable offline from one
+// captured cookie, where no rate limit applies.
+const MIN_SECRET_LENGTH = 32;
+
+// $2a$/$2b$/$2y$, a two-digit cost, then a 53-char salt+digest.
+const BCRYPT_HASH = /^\$2[aby]\$\d{2}\$[./A-Za-z0-9]{53}$/;
+
+let warned = false;
+
+/** Logs once why the gate refused to come up. Never prints any value. */
+function warnOnce(reason: string): void {
+  if (warned) return;
+  warned = true;
+  console.error(`[ops] /ops is disabled: ${reason}`);
+}
+
 function readEnv(env?: OpsEnv): OpsEnv {
   return env ?? (process.env as OpsEnv);
 }
@@ -20,10 +36,28 @@ function allowedEmails(env?: OpsEnv): string[] {
     .split(",").map((s) => s.trim().toLowerCase()).filter(Boolean);
 }
 
-/** True only when every credential the gate needs is configured. Fails closed. */
+/**
+ * True only when every credential the gate needs is present AND well-formed.
+ * Fails closed: a misconfigured gate is a 404, never a weakened gate. The
+ * reason is logged once to the container log, because a bare 404 is otherwise
+ * impossible to diagnose.
+ */
 export function opsEnabled(env?: OpsEnv): boolean {
   const e = readEnv(env);
-  return Boolean(e.OPS_PASSWORD_HASH?.trim() && e.OPS_SECRET?.trim() && allowedEmails(env).length);
+  const secret = e.OPS_SECRET?.trim() ?? "";
+  const hash = e.OPS_PASSWORD_HASH?.trim() ?? "";
+
+  if (!allowedEmails(env).length) { warnOnce("OPS_ADMIN_EMAILS is empty"); return false; }
+  if (!hash) { warnOnce("OPS_PASSWORD_HASH is not set"); return false; }
+  if (!BCRYPT_HASH.test(hash)) {
+    warnOnce("OPS_PASSWORD_HASH is not a bcrypt hash — did a plaintext password get pasted in?");
+    return false;
+  }
+  if (secret.length < MIN_SECRET_LENGTH) {
+    warnOnce(`OPS_SECRET must be at least ${MIN_SECRET_LENGTH} characters`);
+    return false;
+  }
+  return true;
 }
 
 export function isAllowedEmail(email: string, env?: OpsEnv): boolean {

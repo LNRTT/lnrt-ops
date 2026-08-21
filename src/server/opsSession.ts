@@ -33,10 +33,17 @@ export async function verifyOpsToken(
   }
 }
 
-export function opsCookieAttrs(maxAgeSeconds: number) {
+/**
+ * `secure` defaults to true and the caller opts out explicitly. Deriving it from
+ * NODE_ENV silently drops the flag on any HTTPS deployment that does not happen
+ * to set NODE_ENV=production — a footgun on the most sensitive cookie here.
+ * Browsers accept Secure cookies on http://localhost, so local development is
+ * unaffected by the default.
+ */
+export function opsCookieAttrs(maxAgeSeconds: number, opts: { secure?: boolean } = {}) {
   return {
     httpOnly: true as const,
-    secure: process.env.NODE_ENV === "production",
+    secure: opts.secure ?? true,
     sameSite: "strict" as const,
     path: "/ops" as const,
     maxAge: maxAgeSeconds,

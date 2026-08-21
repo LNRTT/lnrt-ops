@@ -4,7 +4,8 @@ import bcrypt from "bcryptjs";
 import { opsEnabled, isAllowedEmail, verifyCredentials } from "./gate";
 
 const HASH = bcrypt.hashSync("correct horse", 10);
-const ENV = { OPS_ADMIN_EMAILS: "me@lnrt.cz, Other@LNRT.cz", OPS_PASSWORD_HASH: HASH, OPS_SECRET: "s" };
+const SECRET = "a-secret-at-least-32-characters-long!!";
+const ENV = { OPS_ADMIN_EMAILS: "me@lnrt.cz, Other@LNRT.cz", OPS_PASSWORD_HASH: HASH, OPS_SECRET: SECRET };
 
 test("is disabled unless all three variables are present", () => {
   assert.equal(opsEnabled(ENV), true);
@@ -12,6 +13,22 @@ test("is disabled unless all three variables are present", () => {
   assert.equal(opsEnabled({ ...ENV, OPS_ADMIN_EMAILS: undefined }), false);
   assert.equal(opsEnabled({ ...ENV, OPS_SECRET: undefined }), false);
   assert.equal(opsEnabled({ ...ENV, OPS_ADMIN_EMAILS: "   " }), false);
+});
+
+test("is disabled when OPS_SECRET is too short to resist offline cracking", () => {
+  // An HS256 key this weak can be brute-forced offline from a single captured
+  // cookie, with no rate limit in the way, and then used to forge any session.
+  assert.equal(opsEnabled({ ...ENV, OPS_SECRET: "s" }), false);
+  assert.equal(opsEnabled({ ...ENV, OPS_SECRET: "x".repeat(31) }), false);
+  assert.equal(opsEnabled({ ...ENV, OPS_SECRET: "x".repeat(32) }), true);
+});
+
+test("is disabled when OPS_PASSWORD_HASH is not a bcrypt hash", () => {
+  // A plaintext password pasted in by mistake would make bcrypt.compare fail
+  // fast on the allowed path while the decoy path still burns full cost-10
+  // work — reopening the timing oracle the decoy exists to close.
+  assert.equal(opsEnabled({ ...ENV, OPS_PASSWORD_HASH: "hunter2" }), false);
+  assert.equal(opsEnabled({ ...ENV, OPS_PASSWORD_HASH: HASH.slice(0, -1) }), false);
 });
 
 test("matches allowed emails case-insensitively and ignores whitespace", () => {
@@ -43,4 +60,9 @@ test("does an equal amount of work for a listed and an unlisted email", async ()
 
 test("returns false rather than throwing when disabled", async () => {
   assert.equal(await verifyCredentials("me@lnrt.cz", "correct horse", {}), false);
+});
+
+test("refuses the right password when the gate is misconfigured", async () => {
+  assert.equal(await verifyCredentials("me@lnrt.cz", "correct horse", { ...ENV, OPS_SECRET: "s" }), false);
+  assert.equal(await verifyCredentials("me@lnrt.cz", "hunter2", { ...ENV, OPS_PASSWORD_HASH: "hunter2" }), false);
 });
