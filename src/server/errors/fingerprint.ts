@@ -67,7 +67,7 @@ const LOCATION = /\(?([^\s()]+:\d+(?::\d+)?)\)?$/;
  * Understands both the V8 stack shape (`at fn (loc)`) used by Chrome/Node and
  * the SpiderMonkey/JSC shape (`fn@loc`) used by Firefox and Safari.
  */
-function firstAppFrame(stack: string | undefined): string {
+export function firstAppFrame(stack: string | undefined): string {
   if (!stack) return "";
   for (const line of stack.split("\n")) {
     const trimmed = line.trim();

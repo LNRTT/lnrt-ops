@@ -14,7 +14,7 @@ export function getPool(connectionString: string): Pool {
   let pool = pools.get(connectionString);
   if (pool?.ended) pool = undefined;
   if (!pool) {
-    pool = new Pool({ connectionString, max: 4, idleTimeoutMillis: 30_000 });
+    pool = new Pool({ connectionString, max: 4, idleTimeoutMillis: 30_000, connectionTimeoutMillis: 5_000 });
     // A pool-level error (e.g. the database restarting) must never crash the host process.
     pool.on("error", (err) => console.error("[ops] idle client error", err));
     pools.set(connectionString, pool);

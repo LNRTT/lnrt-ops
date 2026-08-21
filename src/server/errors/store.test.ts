@@ -169,19 +169,26 @@ test("listErrorEvents returns newest first", async () => {
   );
 });
 
-test("pruneErrors deletes events older than N days and keeps the groups", async () => {
+test("pruneErrors deletes only the old event, keeps the recent one, and decrements stored_count to match", async () => {
   const err = makeError("kilo");
-  await recordError(pool, err);
+  await recordError(pool, { ...err, requestId: "old" });
+  await recordError(pool, { ...err, requestId: "recent" });
   const id = fingerprint(err);
-  await pool.query(`UPDATE ops_error_event SET at = now() - interval '40 days' WHERE group_id = $1`, [id]);
+  await pool.query(
+    `UPDATE ops_error_event SET at = now() - interval '40 days' WHERE group_id = $1 AND request_id = $2`,
+    [id, "old"],
+  );
 
   const deleted = await pruneErrors(pool, 30);
-  assert.ok(deleted >= 1);
+  assert.equal(deleted, 1);
 
   const events = await listErrorEvents(pool, id);
-  assert.equal(events.length, 0);
+  assert.equal(events.length, 1);
+  assert.equal(events[0]!.requestId, "recent");
+
   const group = await getErrorGroup(pool, id);
   assert.ok(group, "the group survives pruning");
+  assert.equal(group!.storedCount, 1, "stored_count reflects what actually remains");
 });
 
 test("context is redacted on the way in and cookies never land in the row", async () => {
@@ -203,4 +210,127 @@ test("context is redacted on the way in and cookies never land in the row", asyn
   const rawFlat = JSON.stringify(raw.rows[0].context);
   assert.equal(rawFlat.includes("abc123"), false);
   assert.equal(rawFlat.includes("hunter2"), false);
+});
+
+// --- fix-pass-1 additions -------------------------------------------------
+
+test("two concurrent captures of the same new fingerprint produce one group with event_count 2", async () => {
+  const err = makeError("mike-concurrent");
+  await Promise.all([recordError(pool, err), recordError(pool, err)]);
+  const id = fingerprint(err);
+  const group = await getErrorGroup(pool, id);
+  assert.ok(group);
+  assert.equal(group!.eventCount, 2);
+  assert.equal(group!.storedCount, 2);
+  const events = await listErrorEvents(pool, id);
+  assert.equal(events.length, 2);
+});
+
+test("a burst of concurrent captures past the cap stores exactly 100 and counts them all", async () => {
+  const err = makeError("november-burst");
+  const BURST = 150;
+  await Promise.all(Array.from({ length: BURST }, () => recordError(pool, err)));
+  const id = fingerprint(err);
+  const group = await getErrorGroup(pool, id);
+  assert.ok(group);
+  assert.equal(group!.eventCount, BURST);
+  assert.equal(group!.storedCount, 100);
+
+  const { rows } = await pool.query("SELECT count(*)::int AS c FROM ops_error_event WHERE group_id = $1", [id]);
+  assert.equal(rows[0].c, 100);
+});
+
+test("a context with a bigint and a NUL byte is still recorded, with the event stored", async () => {
+  const err = makeError("oscar", {
+    context: { rows: 42n, note: "hello" + String.fromCharCode(0) + "world" },
+  });
+  await assert.doesNotReject(() => recordError(pool, err));
+  const id = fingerprint(err);
+  const group = await getErrorGroup(pool, id);
+  assert.ok(group);
+  assert.equal(group!.eventCount, 1);
+  assert.equal(group!.storedCount, 1);
+
+  const events = await listErrorEvents(pool, id);
+  assert.equal(events.length, 1);
+  const ctx = events[0]!.context as Record<string, unknown>;
+  assert.equal(ctx.rows, "42");
+  assert.equal((ctx.note as string).includes(String.fromCharCode(0)), false);
+});
+
+test("an oversized context is replaced rather than dropping the capture", async () => {
+  const context: Record<string, unknown> = {};
+  for (let i = 0; i < 10; i++) context[`field${i}`] = "y".repeat(2000);
+  const err = makeError("papa", { context });
+  await recordError(pool, err);
+  const id = fingerprint(err);
+
+  const events = await listErrorEvents(pool, id);
+  assert.equal(events.length, 1);
+  assert.deepEqual(events[0]!.context, { _dropped: "context too large" });
+});
+
+test("a URL with a query string is stored without it", async () => {
+  const err = makeError("quebec", { url: "/reset?token=SECRET&x=1#frag" });
+  await recordError(pool, err);
+  const id = fingerprint(err);
+  const events = await listErrorEvents(pool, id);
+  assert.equal(events[0]!.url, "/reset");
+  assert.equal(events[0]!.url!.includes("SECRET"), false);
+});
+
+test("recordError against an unreachable pool resolves rather than throwing", async () => {
+  const badPool = new Pool({
+    connectionString: "postgres://user:pass@127.0.0.1:1/nope",
+    max: 1,
+    connectionTimeoutMillis: 300,
+  });
+  try {
+    await assert.doesNotReject(() => recordError(badPool, makeError("romeo")));
+  } finally {
+    await badPool.end();
+  }
+});
+
+test("listErrorGroups filters combine to an intersection", async () => {
+  const matchAll = makeError("sierra-match", { source: "browser", userId: "u-99" });
+  const wrongSource = makeError("sierra-wrong-source", { source: "server", userId: "u-99" });
+  const wrongUser = makeError("sierra-wrong-user", { source: "browser", userId: "u-100" });
+  await recordError(pool, matchAll);
+  await recordError(pool, wrongSource);
+  await recordError(pool, wrongUser);
+  const matchId = fingerprint(matchAll);
+  const wrongSourceId = fingerprint(wrongSource);
+  const wrongUserId = fingerprint(wrongUser);
+
+  const results = await listErrorGroups(pool, {
+    status: "open",
+    source: "browser",
+    since: new Date(Date.now() - 60_000),
+    userId: "u-99",
+  });
+  assert.ok(results.some((g) => g.id === matchId));
+  assert.ok(!results.some((g) => g.id === wrongSourceId));
+  assert.ok(!results.some((g) => g.id === wrongUserId));
+});
+
+test("a header line ending in :N:N is not mistaken for a stack frame", async () => {
+  const err = makeError("tango", {
+    stack: "Error: failed to parse config.yaml:12:3\n    at parseConfig (/app/src/lib/configLoader.ts:9:5)",
+  });
+  await recordError(pool, err);
+  const id = fingerprint(err);
+  const group = await getErrorGroup(pool, id);
+  assert.ok(group);
+  assert.equal(group!.culprit.includes("config.yaml"), false);
+  assert.ok(group!.culprit.includes("configLoader.ts"), `got culprit: ${group!.culprit}`);
+});
+
+test("source stays at its first-seen value even when a later capture reports a different source", async () => {
+  const err = makeError("uniform", { source: "server" });
+  await recordError(pool, err);
+  await recordError(pool, { ...err, source: "browser" });
+  const id = fingerprint(err);
+  const group = await getErrorGroup(pool, id);
+  assert.equal(group!.source, "server");
 });
