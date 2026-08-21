@@ -28,6 +28,14 @@ The gate, user administration, audit log, health checks and UI land in later tas
 - The package never stores or logs plaintext passwords, environment variable values,
   cookies, or `Authorization` headers.
 
+## Security notes
+
+- Rotating `OPS_PASSWORD_HASH` does **not** invalidate outstanding session cookies:
+  those are signed with `OPS_SECRET`, not derived from the password hash. A leaked
+  session cookie survives a password change for up to 8 hours (`OPS_TTL_SECONDS`).
+  To revoke sessions immediately, rotate `OPS_SECRET` instead — that invalidates
+  every outstanding cookie at once, including your own.
+
 ## Installing in a host project
 
 ```bash
