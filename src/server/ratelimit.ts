@@ -4,7 +4,7 @@ export type RateLimiter = {
   reset(key: string): void;
 };
 
-type Entry = { failures: number[]; blockedUntil: number };
+export type Entry = { failures: number[]; blockedUntil: number };
 
 /**
  * In-memory sliding-window limiter.
@@ -22,6 +22,31 @@ type Entry = { failures: number[]; blockedUntil: number };
 // a bit — it never grows the map, since sweeping only ever removes entries.
 const SWEEP_EVERY = 1000;
 
+function prune(e: Entry, windowMs: number, t: number): void {
+  e.failures = e.failures.filter((at) => t - at < windowMs);
+}
+
+// An entry is "dead" once its block (if any) has expired and it has no
+// failures left inside the window: at that point it is indistinguishable
+// from a key that was never seen, so dropping it changes no observable
+// behaviour — a later check()/fail() just recreates it from scratch.
+function isDead(e: Entry, t: number): boolean {
+  return e.blockedUntil <= t && e.failures.length === 0;
+}
+
+/**
+ * Delete dead entries from the map in place: entries whose block (if any)
+ * has expired and which have no failures left inside the window. Pure given
+ * its explicit inputs — no dependency on a limiter instance — so it can be
+ * tested directly instead of through a test-only introspection seam.
+ */
+export function sweep(entries: Map<string, Entry>, opts: { windowMs: number }, t: number): void {
+  for (const [key, e] of entries) {
+    prune(e, opts.windowMs, t);
+    if (isDead(e, t)) entries.delete(key);
+  }
+}
+
 export function makeRateLimiter(opts: {
   limit: number; windowMs: number; blockMs: number; now?: () => number;
 }): RateLimiter {
@@ -29,32 +54,13 @@ export function makeRateLimiter(opts: {
   const entries = new Map<string, Entry>();
   let failsSinceSweep = 0;
 
-  function prune(e: Entry, t: number): void {
-    e.failures = e.failures.filter((at) => t - at < opts.windowMs);
-  }
-
-  // An entry is "dead" once its block (if any) has expired and it has no
-  // failures left inside the window: at that point it is indistinguishable
-  // from a key that was never seen, so dropping it changes no observable
-  // behaviour — a later check()/fail() just recreates it from scratch.
-  function isDead(e: Entry, t: number): boolean {
-    return e.blockedUntil <= t && e.failures.length === 0;
-  }
-
-  function sweep(t: number): void {
-    for (const [key, e] of entries) {
-      prune(e, t);
-      if (isDead(e, t)) entries.delete(key);
-    }
-  }
-
-  const limiter = {
+  return {
     check(key: string) {
       const t = now();
       const e = entries.get(key);
       if (!e) return { ok: true as const };
       if (e.blockedUntil > t) return { ok: false as const, retryAfterMs: e.blockedUntil - t };
-      prune(e, t);
+      prune(e, opts.windowMs, t);
       if (e.failures.length >= opts.limit) {
         // Consistent with fail(): once the failure count is (still) at or
         // above the limit, the key is blocked for blockMs from now, and the
@@ -69,7 +75,7 @@ export function makeRateLimiter(opts: {
     fail(key: string) {
       const t = now();
       const e = entries.get(key) ?? { failures: [], blockedUntil: 0 };
-      prune(e, t);
+      prune(e, opts.windowMs, t);
       e.failures.push(t);
       if (e.failures.length >= opts.limit) e.blockedUntil = t + opts.blockMs;
       entries.set(key, e);
@@ -77,22 +83,9 @@ export function makeRateLimiter(opts: {
       failsSinceSweep++;
       if (failsSinceSweep >= SWEEP_EVERY) {
         failsSinceSweep = 0;
-        sweep(t);
+        sweep(entries, opts, t);
       }
     },
     reset(key: string) { entries.delete(key); },
-    // Introspection for tests only — not part of the RateLimiter contract.
-    __size(): number { return entries.size; },
   };
-
-  return limiter;
-}
-
-/**
- * Test-only introspection of how many keys a limiter is currently tracking.
- * Not part of the RateLimiter contract — used to assert eviction actually
- * shrinks the map, without exposing internals through the public interface.
- */
-export function __entryCount(rl: RateLimiter): number {
-  return (rl as unknown as { __size(): number }).__size();
 }

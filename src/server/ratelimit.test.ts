@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { makeRateLimiter, __entryCount } from "./ratelimit";
+import { makeRateLimiter, sweep, type Entry } from "./ratelimit";
 
 function limiterAt(clock: { t: number }) {
   return makeRateLimiter({ limit: 5, windowMs: 15 * 60_000, blockMs: 15 * 60_000, now: () => clock.t });
@@ -49,26 +49,31 @@ test("keys are independent and reset clears one", () => {
   assert.equal(rl.check("a").ok, true);
 });
 
-test("evicts dead entries during fail() sweeps, keeping memory bounded", () => {
-  const clock = { t: 0 };
-  const rl = limiterAt(clock);
+test("sweep evicts entries whose block has expired and which have no failures left in the window, keeping the rest", () => {
+  const windowMs = 15 * 60_000;
+  const t = 1_000_000;
 
-  // Simulate a credential-stuffing bot rotating through many source IPs, each
-  // failing once (never reaching the block threshold).
-  const ROTATED_IPS = 50;
-  for (let i = 0; i < ROTATED_IPS; i++) rl.fail(`ip-${i}`);
-  assert.equal(__entryCount(rl), ROTATED_IPS);
+  const entries = new Map<string, Entry>([
+    // Dead: no active block, and its only failure is older than the window.
+    ["dead-expired-failure", { failures: [t - windowMs - 1], blockedUntil: 0 }],
+    // Dead: block already expired, and no failures recorded at all.
+    ["dead-block-expired", { failures: [], blockedUntil: t - 1 }],
+    // Live: block still in effect, even though there are no failures on file.
+    ["live-blocked", { failures: [], blockedUntil: t + 1 }],
+    // Live: has a failure still inside the window.
+    ["live-recent-failure", { failures: [t - 1], blockedUntil: 0 }],
+    // Live: a mix of an out-of-window failure and a recent one. The entry
+    // survives, and the stale failure is pruned away as a side effect.
+    ["live-mixed-failures", { failures: [t - windowMs - 1, t - 10], blockedUntil: 0 }],
+  ]);
 
-  // Move the clock past the window (and block) so every existing entry is now
-  // "dead": no failures left inside the window, and no active block.
-  clock.t += 15 * 60_000 + 1;
+  sweep(entries, { windowMs }, t);
 
-  // Drive enough fail() calls (on a fresh key, so we don't resurrect any of the
-  // old entries) to cross the sweep trigger at least once.
-  for (let i = 0; i < 1000; i++) rl.fail("sweeper");
-
-  // All ROTATED_IPS dead entries should have been evicted; only "sweeper" is left.
-  assert.equal(__entryCount(rl), 1, `expected the map to shrink to just the live key`);
+  assert.deepEqual(
+    [...entries.keys()].sort(),
+    ["live-blocked", "live-mixed-failures", "live-recent-failure"],
+  );
+  assert.deepEqual(entries.get("live-mixed-failures")?.failures, [t - 10]);
 });
 
 test("check()'s over-limit branch reports a real, counting-down wait when blockMs < windowMs", () => {
