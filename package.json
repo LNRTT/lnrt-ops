@@ -1,13 +1,23 @@
 {
   "name": "@lnrt/ops",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": false,
   "type": "module",
-  "engines": { "node": ">=22" },
-  "files": ["dist"],
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "dist"
+  ],
   "exports": {
-    "./server": { "types": "./dist/server/index.d.ts", "default": "./dist/server/index.js" },
-    "./next": { "types": "./dist/next/index.d.ts", "default": "./dist/next/index.js" }
+    "./server": {
+      "types": "./dist/server/index.d.ts",
+      "default": "./dist/server/index.js"
+    },
+    "./next": {
+      "types": "./dist/next/index.d.ts",
+      "default": "./dist/next/index.js"
+    }
   },
   "scripts": {
     "build": "tsup",
@@ -15,8 +25,16 @@
     "test": "tsx --experimental-test-module-mocks --test 'src/**/*.test.{ts,tsx}'",
     "prepare": "npm run build"
   },
-  "dependencies": { "pg": "^8.20.0", "bcryptjs": "^3.0.3", "jose": "^6.2.2" },
-  "peerDependencies": { "next": ">=16", "react": ">=19", "react-dom": ">=19" },
+  "dependencies": {
+    "pg": "^8.20.0",
+    "bcryptjs": "^3.0.3",
+    "jose": "^6.2.2"
+  },
+  "peerDependencies": {
+    "next": ">=16",
+    "react": ">=19",
+    "react-dom": ">=19"
+  },
   "devDependencies": {
     "typescript": "^5.9.3",
     "tsx": "^4.23.12",
