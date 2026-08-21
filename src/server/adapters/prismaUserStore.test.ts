@@ -103,6 +103,37 @@ test("disable and restore write the mapped column", async () => {
   assert.equal(off.deactivatedAt, null);
 });
 
+test("supports a boolean disabled column without inverting the state", async () => {
+  // A host with `active BOOLEAN NOT NULL`, where false means disabled.
+  const boolOpts = { fields: { disabledAt: { field: "active", kind: "boolean" as const, disabledWhen: false } } };
+
+  const activeRow = { ...ROW, active: true, deactivatedAt: undefined };
+  const s1 = store(fakePrisma([activeRow]), boolOpts);
+  assert.equal((await s1.list({})).users[0]!.disabled, false);
+
+  const disabledRow = { ...ROW, active: false, deactivatedAt: undefined };
+  const prisma = fakePrisma([disabledRow]);
+  const s2 = store(prisma, boolOpts);
+  assert.equal((await s2.list({ includeDisabled: true })).users[0]!.disabled, true,
+    "false in a boolean column must read as disabled, not as 'no value'");
+});
+
+test("filters and writes a boolean disabled column with real booleans, never null", async () => {
+  const boolOpts = { fields: { disabledAt: { field: "active", kind: "boolean" as const, disabledWhen: false } } };
+
+  const listing = fakePrisma([{ ...ROW, active: true }]);
+  await store(listing, boolOpts).list({});
+  const where = (listing.calls[0]!.args as { where: Record<string, unknown> }).where;
+  assert.equal(where.active, true, "must select active rows, not `active: null`");
+
+  const writing = fakePrisma([{ ...ROW, active: true }]);
+  const s = store(writing, boolOpts);
+  await s.setDisabled("u1", true);
+  assert.deepEqual((writing.calls[0]!.args as { data: unknown }).data, { active: false });
+  await s.setDisabled("u1", false);
+  assert.deepEqual((writing.calls[1]!.args as { data: unknown }).data, { active: true });
+});
+
 test("rejects a role outside the declared list", async () => {
   await assert.rejects(() => store(fakePrisma([ROW])).setRole("u1", "GOD"), /Unknown role/);
 });

@@ -1,5 +1,16 @@
 import type { OpsUser, OpsUserPage, OpsUserQuery, OpsUserStore } from "../users";
 
+/**
+ * How a host marks an account as disabled. A bare string means the common case:
+ * a nullable timestamp that is NULL while the account is active. Hosts that use
+ * a boolean column must say so — otherwise the adapter would write NULL into a
+ * NOT NULL column and read `false` as "not disabled", inverting the state.
+ */
+export type DisabledField =
+  | string
+  | { field: string; kind: "timestamp" }
+  | { field: string; kind: "boolean"; /** The column value that means disabled. */ disabledWhen: boolean };
+
 export type PrismaUserStoreOptions = {
   /** Delegate name on the Prisma client, e.g. "user". */
   model: string;
@@ -7,7 +18,7 @@ export type PrismaUserStoreOptions = {
   /** Column names, when they differ from the defaults shown here. */
   fields?: {
     email?: string; name?: string; role?: string;
-    passwordHash?: string; disabledAt?: string; lastSignInAt?: string;
+    passwordHash?: string; disabledAt?: DisabledField; lastSignInAt?: string;
   };
   hashPassword(plaintext: string): Promise<string>;
   /** Off by default. Only enable where no domain data references the user row. */
@@ -23,16 +34,40 @@ type Delegate = {
   delete(args: unknown): Promise<Record<string, unknown>>;
 };
 
+type NormalizedDisabled =
+  | { field: string; kind: "timestamp" }
+  | { field: string; kind: "boolean"; disabledWhen: boolean };
+
+function normalizeDisabledField(d: DisabledField): NormalizedDisabled {
+  return typeof d === "string" ? { field: d, kind: "timestamp" } : d;
+}
+
+/** The value to write for a given disabled state. */
+function disabledValue(d: NormalizedDisabled, isDisabled: boolean): unknown {
+  if (d.kind === "boolean") return isDisabled ? d.disabledWhen : !d.disabledWhen;
+  return isDisabled ? new Date() : null;
+}
+
+/** The `where` fragment selecting accounts that are NOT disabled. */
+function notDisabledWhere(d: NormalizedDisabled): unknown {
+  return d.kind === "boolean" ? !d.disabledWhen : null;
+}
+
+function isDisabledRow(d: NormalizedDisabled, value: unknown): boolean {
+  return d.kind === "boolean" ? value === d.disabledWhen : Boolean(value);
+}
+
 export function prismaUserStore(prisma: unknown, opts: PrismaUserStoreOptions): OpsUserStore {
   const delegate = (prisma as Record<string, Delegate>)[opts.model];
   if (!delegate) throw new Error(`Prisma client has no "${opts.model}" delegate.`);
+
+  const disabled = normalizeDisabledField(opts.fields?.disabledAt ?? "disabledAt");
 
   const f = {
     email: opts.fields?.email ?? "email",
     name: opts.fields?.name ?? "name",
     role: opts.fields?.role ?? "role",
     passwordHash: opts.fields?.passwordHash ?? "passwordHash",
-    disabledAt: opts.fields?.disabledAt ?? "disabledAt",
     lastSignInAt: opts.fields?.lastSignInAt,
   };
 
@@ -42,7 +77,7 @@ export function prismaUserStore(prisma: unknown, opts: PrismaUserStoreOptions): 
       email: String(row[f.email] ?? ""),
       name: String(row[f.name] ?? ""),
       role: String(row[f.role] ?? ""),
-      disabled: Boolean(row[f.disabledAt]),
+      disabled: isDisabledRow(disabled, row[disabled.field]),
       hasPassword: Boolean(row[f.passwordHash]),
       lastSignInAt: f.lastSignInAt ? ((row[f.lastSignInAt] as Date | null) ?? null) : null,
     };
@@ -50,7 +85,7 @@ export function prismaUserStore(prisma: unknown, opts: PrismaUserStoreOptions): 
 
   function buildWhere(q: OpsUserQuery): Record<string, unknown> {
     const where: Record<string, unknown> = {};
-    if (!q.includeDisabled) where[f.disabledAt] = null;
+    if (!q.includeDisabled) where[disabled.field] = notDisabledWhere(disabled);
     if (q.role) where[f.role] = q.role;
     if (q.search) {
       where.OR = [
@@ -102,8 +137,10 @@ export function prismaUserStore(prisma: unknown, opts: PrismaUserStoreOptions): 
       await delegate.update({ where: { id }, data: { [f.role]: role } });
     },
 
-    async setDisabled(id, disabled) {
-      await delegate.update({ where: { id }, data: { [f.disabledAt]: disabled ? new Date() : null } });
+    async setDisabled(id, isDisabled) {
+      await delegate.update({
+        where: { id }, data: { [disabled.field]: disabledValue(disabled, isDisabled) },
+      });
     },
   };
 
