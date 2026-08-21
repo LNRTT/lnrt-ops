@@ -6,6 +6,12 @@ import { Pool } from "pg";
  * shared database makes them race on DDL.
  *
  * Test-only: nothing in the shipped bundle imports this module.
+ *
+ * Precondition: one test runner at a time per OPS_TEST_DATABASE_URL. The database
+ * name is derived from `name` alone, so two concurrent `npm test` runs against the
+ * same server (e.g. two sessions sharing this container) will have one run's
+ * DROP DATABASE ... WITH (FORCE) terminate the other's live connections. Failures
+ * are loud rather than silent, but they are not the code's fault.
  */
 export async function createTestDatabase(name: string): Promise<string> {
   const base = process.env.OPS_TEST_DATABASE_URL;
