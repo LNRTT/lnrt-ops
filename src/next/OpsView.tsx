@@ -66,16 +66,34 @@ export async function OpsView({ ops, path, search, cookieHeader }: OpsViewProps)
     );
   }
 
-  await ops.ready();
-  const store = ops.config.users;
   const csrf = csrfToken(s.email, process.env.OPS_SECRET ?? "");
+
+  // Routed before `ops.ready()`: `ready()` runs migrations and rejects when
+  // Postgres is unreachable, and the health page is the one view whose entire
+  // job is to report exactly that. `runChecks` isolates each check's own
+  // failure, and `checkMigrations` reads the ledger itself (no migration run
+  // required), so health needs nothing from `ready()`.
+  if (path[0] === "health") {
+    return <Shell csrf={csrf}><Health results={await runChecks(ops.checks(), { pool: ops.pool })} /></Shell>;
+  }
+
+  try {
+    await ops.ready();
+  } catch {
+    return (
+      <Shell csrf={csrf}>
+        <div className="ops-card">
+          <p className="ops-error">The operations database is unavailable.</p>
+          <p className="ops-note"><a href="/ops/health">Check the health page</a> for details.</p>
+        </div>
+      </Shell>
+    );
+  }
+
+  const store = ops.config.users;
 
   if (path[0] === "audit") {
     return <Shell csrf={csrf}><Audit rows={await listAudit(ops.pool, { limit: 200 })} /></Shell>;
-  }
-
-  if (path[0] === "health") {
-    return <Shell csrf={csrf}><Health results={await runChecks(ops.checks(), { pool: ops.pool })} /></Shell>;
   }
 
   if (path[0] === "users" && path[1]) {
@@ -111,8 +129,7 @@ export async function OpsView({ ops, path, search, cookieHeader }: OpsViewProps)
   });
   return (
     <Shell csrf={csrf}>
-      <datalist id="ops-roles">{store.roles.map((r) => <option key={r} value={r} />)}</datalist>
-      <Users users={users} total={total} query={query} csrf={csrf} />
+      <Users users={users} total={total} query={query} roles={store.roles} csrf={csrf} />
     </Shell>
   );
 }

@@ -18,9 +18,12 @@ export function UserDetail({
 
       {reveal && (
         <div className="ops-card">
-          <h2>{reveal.kind === "password" ? "New password" : "Sign-in link"} — shown once</h2>
+          <h2>{reveal.kind === "password" ? "New password" : "Sign-in link"}</h2>
           <p className="ops-reveal">{reveal.value}</p>
-          <p className="ops-note">Copy it now. It is not stored and will not be shown again.</p>
+          <p className="ops-note">
+            Copy it now. It is not stored server-side, and the cookie carrying it expires within a
+            minute — a refresh or a back-navigation before then will show it again.
+          </p>
         </div>
       )}
 

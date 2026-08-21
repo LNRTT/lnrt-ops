@@ -93,19 +93,27 @@ function timingSafeStringEqual(a: string, b: string): boolean {
 // and have the portal render an attacker-chosen link or password to the
 // operator.
 
-type FlashPayload = { kind: "password" | "link"; user: string; value: string };
+export type FlashPayload = { kind: "password" | "link"; user: string; value: string };
 
 function signFlashPayload(json: string, secret: string): string {
   return createHmac("sha256", secret).update(json).digest("base64url");
 }
 
+/**
+ * Signs a flash payload into the raw cookie value `readFlash` expects
+ * (`${json}.${sig}`). Exported so tests can construct a validly-signed flash
+ * cookie the same way a real request does, without going through a full POST.
+ */
+export function signFlash(payload: FlashPayload, secret: string): string {
+  const json = Buffer.from(JSON.stringify(payload)).toString("base64url");
+  return `${json}.${signFlashPayload(json, secret)}`;
+}
+
 /** Stores a one-time reveal in a short-lived, signed cookie — never in the redirect URL. */
 function flashCookie(req: Request, payload: FlashPayload): string {
   const secret = process.env.OPS_SECRET!;
-  const json = Buffer.from(JSON.stringify(payload)).toString("base64url");
-  const sig = signFlashPayload(json, secret);
   return serializeCookie(
-    OPS_FLASH_COOKIE, `${json}.${sig}`, opsCookieAttrs(60, { secure: isSecureRequest(req) }),
+    OPS_FLASH_COOKIE, signFlash(payload, secret), opsCookieAttrs(60, { secure: isSecureRequest(req) }),
   );
 }
 

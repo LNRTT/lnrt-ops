@@ -138,6 +138,9 @@ other storage layer.
   host application's own tables.
 - The package never stores or logs plaintext passwords, environment variable values,
   cookies, or `Authorization` headers.
+- `typescript` is pinned to `^5.9.3` deliberately — do not let `npm update` bump it
+  past 6. tsup 8.5.1 bundles `rollup-plugin-dts@6.1.1`, whose peer range is
+  `^4.5 || ^5.0`, and TypeScript 7 crashes its declaration build.
 
 ## Security notes
 
@@ -146,6 +149,24 @@ other storage layer.
   session cookie survives a password change for up to 8 hours (`OPS_TTL_SECONDS`).
   To revoke sessions immediately, rotate `OPS_SECRET` instead — that invalidates
   every outstanding cookie at once, including your own.
+
+### Hosts that forward request headers to an error tracker must scrub two cookies
+
+`lnrt_ops_flash` carries a one-time reveal — a freshly generated password or a
+minted sign-in link — in a signed, short-lived (60 second) cookie. If a request
+fails while that cookie is set (a password reset that redirects into a `store.get`
+that then throws, for example), a host whose error reporting captures request
+headers will ship the whole `Cookie:` header, `lnrt_ops_flash` included, to its
+error tracker. The value there is base64url-encoded, which is not encryption and
+is trivially decoded — a support engineer skimming an error report could read a
+live password straight off it.
+
+If your host forwards request headers to Sentry, Bugsink, or anything similar,
+scrub `lnrt_ops_flash` **and** `lnrt_ops` (the session cookie) before those
+headers leave the process. The 60-second `Max-Age` on the flash cookie shrinks
+the exposure window, but it is not a defence — the package itself never logs
+cookies, but it hands the host something that must not be logged either, and
+only the host's error-reporting integration is in a position to scrub it.
 
 ## Installing in a host project
 

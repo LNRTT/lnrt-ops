@@ -1,7 +1,15 @@
 /**
  * The entire visual layer, inlined. The package must render identically inside a
  * host using Tailwind, plain CSS, or nothing at all, so it imports no stylesheet
- * and inherits nothing. Everything is scoped under .ops-root.
+ * and inherits nothing. Every selector below is anchored on an `ops-`-prefixed
+ * class — there is no bare element, `body`, or `*` rule — so nothing here can
+ * ever match a host element outside this package's own markup, even though not
+ * every rule is literally written as a descendant of `.ops-root`.
+ *
+ * React escapes the text child of a `<style>` element, so a selector containing
+ * `>` or `&` would silently turn into an HTML entity and stop matching, with no
+ * error. That is why every rule here uses plain class selectors and, where
+ * needed, a space (descendant combinator) — never `>` or `&`.
  */
 export const OPS_STYLES = `
 .ops-root { font: 14px/1.5 ui-sans-serif, system-ui, sans-serif; color: #16202c; background: #f6f7f9;

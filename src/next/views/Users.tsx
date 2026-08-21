@@ -1,8 +1,8 @@
 import type { OpsUser } from "../../server/users";
 
 export function Users({
-  users, total, query, csrf,
-}: { users: OpsUser[]; total: number; query: string; csrf: string }) {
+  users, total, query, roles, csrf,
+}: { users: OpsUser[]; total: number; query: string; roles: string[]; csrf: string }) {
   return (
     <>
       <div className="ops-card">
@@ -11,7 +11,10 @@ export function Users({
           <input type="hidden" name="csrf" value={csrf} />
           <input name="email" type="email" placeholder="Email" required />
           <input name="name" placeholder="Name" required />
-          <input name="role" placeholder="Role" required list="ops-roles" />
+          <select name="role" required defaultValue="">
+            <option value="" disabled>Role</option>
+            {roles.map((r) => <option key={r} value={r}>{r}</option>)}
+          </select>
           <button type="submit">Create</button>
         </form>
         <p className="ops-note">No password is set. A one-time sign-in link is produced instead.</p>
