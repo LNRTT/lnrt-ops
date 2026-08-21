@@ -62,12 +62,36 @@ function stringField(value: unknown): string | undefined {
  * https://this-host'` sails straight through. The size cap and rate limits
  * below are what actually bound a client that isn't playing by browser rules.
  */
+/**
+ * Every host this request could legitimately claim to be. Behind a reverse
+ * proxy `req.url` carries the internal address (`localhost:3000`), not the
+ * public one, so comparing against it alone rejects every genuine browser
+ * report in a proxied deployment. The forwarded headers are what the proxy
+ * says the client asked for.
+ *
+ * Trusting them costs nothing here: a non-browser client can already set
+ * `Origin` to anything, so this check only ever bound real browsers.
+ */
+function acceptableHosts(req: Request): Set<string> {
+  const hosts = new Set<string>();
+  for (const name of ["x-forwarded-host", "host"]) {
+    const value = req.headers.get(name);
+    if (value) for (const h of value.split(",")) if (h.trim()) hosts.add(h.trim());
+  }
+  try {
+    hosts.add(new URL(req.url).host);
+  } catch {
+    // A malformed request URL leaves the forwarded headers to decide.
+  }
+  return hosts;
+}
+
 function isSameOriginIngest(req: Request): boolean {
-  const host = new URL(req.url).host;
+  const hosts = acceptableHosts(req);
   const origin = req.headers.get("origin");
   if (origin) {
     try {
-      return new URL(origin).host === host;
+      return hosts.has(new URL(origin).host);
     } catch {
       return false;
     }
@@ -75,7 +99,7 @@ function isSameOriginIngest(req: Request): boolean {
   const referer = req.headers.get("referer");
   if (referer) {
     try {
-      return new URL(referer).host === host;
+      return hosts.has(new URL(referer).host);
     } catch {
       return false;
     }

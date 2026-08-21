@@ -229,6 +229,36 @@ beforeEach(() => {
   rows2 = [{ id: "u1", email: "a@b.cz", name: "Anna", role: "WORKER", disabled: false, hasPassword: true }];
 });
 
+test("ingest accepts a browser report from behind a reverse proxy", async () => {
+  // Next sees the internal address in req.url when proxied, so comparing the
+  // Origin against that alone rejected every genuine report in production.
+  const req = new Request("http://localhost:3000/ops/api/ingest", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      origin: "https://app.example.com",
+      "x-forwarded-host": "app.example.com",
+      "cf-connecting-ip": "203.0.113.44",
+    },
+    body: JSON.stringify({ type: "Error", message: "proxied" }),
+  });
+  assert.equal((await POST(req)).status, 204);
+});
+
+test("ingest still refuses a genuinely foreign origin behind a proxy", async () => {
+  const req = new Request("http://localhost:3000/ops/api/ingest", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      origin: "https://evil.example",
+      "x-forwarded-host": "app.example.com",
+      "cf-connecting-ip": "203.0.113.45",
+    },
+    body: JSON.stringify({ type: "Error", message: "nope" }),
+  });
+  assert.equal((await POST(req)).status, 403);
+});
+
 test("every response carries noindex and no-store", async () => {
   const res = await POST(form("login", { email: "me@lnrt.cz", password: "wrong" }));
   assert.match(res.headers.get("x-robots-tag")!, /noindex/);
