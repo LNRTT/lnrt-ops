@@ -8,6 +8,8 @@ export function checkDb(): Check {
   return {
     id: "db", label: "Database",
     async run({ pool }) {
+      // Note: this spans pool acquisition as well as the query, so the very
+      // first check against a cold pool can warn on connection setup alone.
       const started = Date.now();
       await pool.query("SELECT 1");
       const ms = Date.now() - started;
@@ -35,8 +37,10 @@ export function checkBuild(): Check {
   return {
     id: "build", label: "Build",
     async run() {
+      // `||`, not `??`: an explicitly empty OPS_RELEASE should fall through
+      // rather than render as a blank release.
       const release =
-        process.env.OPS_RELEASE ?? process.env.GIT_SHA ?? process.env.SOURCE_COMMIT ?? "unknown";
+        process.env.OPS_RELEASE || process.env.GIT_SHA || process.env.SOURCE_COMMIT || "unknown";
       const uptimeMin = Math.floor(process.uptime() / 60);
       return { status: "ok", detail: `release ${release}, node ${process.version}, up ${uptimeMin} min` };
     },

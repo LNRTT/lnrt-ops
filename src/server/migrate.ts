@@ -63,9 +63,19 @@ export async function migrate(pool: Pool, migrations: Migration[]): Promise<stri
   }
 }
 
-/** Ids present in `migrations` but not yet in the ledger. Read-only. */
+/**
+ * Ids present in `migrations` but not yet in the ledger.
+ *
+ * Genuinely read-only: it must never create the ledger, because the health
+ * check calls it on every page view and a database role without CREATE rights
+ * would then see a permissions error where it expected a migration status.
+ * A missing ledger simply means nothing has been applied yet.
+ */
 export async function pendingMigrations(pool: Pool, migrations: Migration[]): Promise<string[]> {
-  await ensureLedger(pool);
+  const { rows } = await pool.query<{ t: string | null }>(
+    "SELECT to_regclass('ops_migration') AS t",
+  );
+  if (!rows[0]?.t) return migrations.map((m) => m.id);
   const done = await appliedIds(pool);
   return migrations.filter((m) => !done.has(m.id)).map((m) => m.id);
 }

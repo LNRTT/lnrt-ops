@@ -32,19 +32,43 @@ test("a throwing check fails on its own without taking the others down", async (
   assert.equal(results[1]!.status, "ok");
 });
 
-test("a hanging check fails on timeout instead of hanging the page", async () => {
+test("a hanging check fails on timeout without blocking the others", async () => {
   const checks: Check[] = [
     { id: "hang", label: "Hang", run: () => new Promise(() => {}) },
+    { id: "fine", label: "Fine", run: async () => ({ status: "ok" }) },
   ];
   const results = await runChecks(checks, { pool }, 50);
   assert.equal(results[0]!.status, "fail");
   assert.match(results[0]!.detail!, /timed out/i);
+  assert.equal(results[1]!.status, "ok", "a hanging check must not take its neighbours with it");
 });
 
 test("the database check reports ok with a latency detail", async () => {
   const [r] = await runChecks([checkDb()], { pool });
   assert.equal(r!.status, "ok");
   assert.match(r!.detail!, /\d+ ?ms/);
+});
+
+test("the database check actually queries the database", async () => {
+  // Without this, an implementation that fabricated "ok, 1 ms" without ever
+  // touching the pool would pass the assertion above.
+  const asked: string[] = [];
+  const spy = {
+    query: async (sql: string) => { asked.push(sql); return { rows: [{ "?column?": 1 }] }; },
+  } as unknown as Pool;
+  const [r] = await runChecks([checkDb()], { pool: spy });
+  assert.equal(r!.status, "ok");
+  assert.deepEqual(asked, ["SELECT 1"]);
+});
+
+test("the database check fails when the database is unreachable", async () => {
+  const dead = new Pool({ connectionString: "postgres://nobody@127.0.0.1:1/none", max: 1 });
+  try {
+    const [r] = await runChecks([checkDb()], { pool: dead });
+    assert.equal(r!.status, "fail");
+  } finally {
+    await dead.end().catch(() => {});
+  }
 });
 
 test("the env check names missing variables and never reveals values", async () => {

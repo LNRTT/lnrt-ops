@@ -34,6 +34,20 @@ test("reports pending ids without applying them", async () => {
   assert.deepEqual(await pendingMigrations(pool, FIXTURES), []);
 });
 
+test("reports everything pending, and writes nothing, when the ledger is absent", async () => {
+  // The health check calls this on every page view, so it must not create the
+  // ledger — a role without CREATE rights would report a permissions error
+  // instead of a migration status.
+  const fresh = new Pool({ connectionString: await createTestDatabase("migrate_readonly") });
+  try {
+    assert.deepEqual(await pendingMigrations(fresh, FIXTURES), ["t001", "t002"]);
+    const { rows } = await fresh.query("SELECT to_regclass('ops_migration') AS t");
+    assert.equal(rows[0].t, null, "pendingMigrations must not have created the ledger");
+  } finally {
+    await fresh.end();
+  }
+});
+
 test("concurrent runs do not double-apply", async () => {
   await pool.query("DROP TABLE IF EXISTS ops_probe; DELETE FROM ops_migration");
   const results = await Promise.all([migrate(pool, FIXTURES), migrate(pool, FIXTURES)]);
