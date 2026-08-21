@@ -16,21 +16,78 @@ export function normalizeMessage(msg: string): string {
     .slice(0, 500);
 }
 
+// A run of 8+ hex chars preceded by `-` or `.` looks like a content hash
+// (e.g. Next.js's `/_next/static/chunks/4821-9f3ac1b2.js`).
+const CONTENT_HASH = /([-.])[0-9a-f]{8,}(?=[-.]|$)/gi;
+
+/**
+ * Normalises a stack frame location so the identical bug fingerprints the
+ * same regardless of deploy (content-hashed chunk names) or environment
+ * (dev absolute path vs. container path).
+ */
+function normalizeLocation(loc: string): string {
+  let out = loc;
+
+  // Drop query string / fragment.
+  out = out.replace(/[?#].*$/, "");
+
+  // Drop origin, keep path.
+  out = out.replace(/^[a-z]+:\/\/[^/]+/i, "");
+
+  // Replace content-hash-looking runs in the filename with a placeholder.
+  out = out.replace(CONTENT_HASH, "$1<hash>");
+
+  // Collapse machine-specific prefixes.
+  const srcIdx = out.indexOf("/src/");
+  const appIdx = out.indexOf("/app/");
+  if (srcIdx !== -1) {
+    out = out.slice(srcIdx);
+  } else if (appIdx !== -1) {
+    out = out.slice(appIdx);
+  } else {
+    const parts = out.split("/");
+    out = parts[parts.length - 1] ?? out;
+  }
+
+  return out;
+}
+
+// V8: "at fn (loc)" or "at loc"
+const V8_FRAME = /^at\s+(.*)$/;
+// SpiderMonkey/JSC: "fn@loc" or "@loc"
+const SPIDERMONKEY_FRAME = /^([^@]*)@(.+)$/;
+// Trailing `path:line:col` or `path:line`, optionally wrapped in parens.
+const LOCATION = /\(?([^\s()]+:\d+(?::\d+)?)\)?$/;
+
 /**
  * The first stack frame belonging to the application rather than a dependency.
  * Grouping on a `node_modules` frame would merge every unrelated bug that
  * happens to fail inside the same library.
+ *
+ * Understands both the V8 stack shape (`at fn (loc)`) used by Chrome/Node and
+ * the SpiderMonkey/JSC shape (`fn@loc`) used by Firefox and Safari.
  */
 function firstAppFrame(stack: string | undefined): string {
   if (!stack) return "";
   for (const line of stack.split("\n")) {
     const trimmed = line.trim();
-    if (!trimmed.startsWith("at ")) continue;
-    if (trimmed.includes("node_modules")) continue;
-    if (trimmed.includes("node:internal")) continue;
-    // Keep file and line, drop the column and any absolute prefix noise.
-    const m = trimmed.match(/\(?([^\s()]+:\d+):\d+\)?$/);
-    if (m) return m[1]!;
+    if (!trimmed) continue;
+
+    let candidate: string | null = null;
+    const v8Match = trimmed.match(V8_FRAME);
+    if (v8Match) {
+      candidate = v8Match[1]!;
+    } else {
+      const smMatch = trimmed.match(SPIDERMONKEY_FRAME);
+      if (smMatch) candidate = smMatch[2]!;
+    }
+    if (candidate === null) continue;
+
+    if (candidate.includes("node_modules")) continue;
+    if (candidate.includes("node:internal")) continue;
+
+    const m = candidate.match(LOCATION);
+    if (m) return normalizeLocation(m[1]!);
   }
   return "";
 }
