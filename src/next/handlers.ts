@@ -2,6 +2,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { writeAudit } from "../server/audit";
 import type { OpsInstance } from "../server/config";
 import { parseCookie, serializeCookie } from "../server/cookies";
+import { recordError, type CapturedError } from "../server/errors/store";
 import { isAllowedEmail, verifyCredentials } from "../server/gate";
 import { runChecks } from "../server/health/index";
 import {
@@ -17,6 +18,53 @@ export const SECURITY_HEADERS: Record<string, string> = {
 };
 
 const loginLimiter = makeRateLimiter({ limit: 5, windowMs: 15 * 60_000, blockMs: 15 * 60_000 });
+
+// A public, unauthenticated write endpoint -- 20 requests per minute per IP,
+// separate state from loginLimiter so a flood of browser error reports can
+// never eat into (or be eaten by) the login lockout's own budget.
+const ingestLimiter = makeRateLimiter({ limit: 20, windowMs: 60_000, blockMs: 60_000 });
+
+// Real request bodies from a browser's own error/rejection handlers are a few
+// hundred bytes; 16 KB leaves headroom for a large stack or context object
+// without letting the endpoint become a place to dump arbitrary data.
+const MAX_INGEST_BYTES = 16 * 1024;
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function stringField(value: unknown): string | undefined {
+  return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+/**
+ * True only when the request's own `Origin` (or, failing that, `Referer`)
+ * names this same host. `/ops/api/ingest` takes no ops session and no CSRF
+ * token -- this same-origin check is the only thing standing between it and
+ * any page on the internet POSTing arbitrary "error reports" into the store.
+ * Neither header present is refused, not allowed: there is nothing to verify
+ * same-origin-ness against.
+ */
+function isSameOriginIngest(req: Request): boolean {
+  const host = new URL(req.url).host;
+  const origin = req.headers.get("origin");
+  if (origin) {
+    try {
+      return new URL(origin).host === host;
+    } catch {
+      return false;
+    }
+  }
+  const referer = req.headers.get("referer");
+  if (referer) {
+    try {
+      return new URL(referer).host === host;
+    } catch {
+      return false;
+    }
+  }
+  return false;
+}
 
 // Values reaching the audit table beyond this point are attacker-controlled
 // (actor/ip/user-agent on a failed, anonymous login) and the columns are
@@ -189,6 +237,90 @@ export function createHandlers(ops: OpsInstance) {
     }
   }
 
+  /**
+   * Parses a browser-reported error out of the request body. Everything is
+   * taken from the body except `source` (always forced to `"browser"`) and
+   * `userId` (never read from the body -- resolved, if at all, from the
+   * host's own session via `ops.config.currentUserId`). Returns `null` for
+   * anything not shaped like a usable report; the caller discards silently
+   * rather than surfacing that to whatever POSTed it.
+   */
+  async function browserEventFromBody(raw: string, req: Request): Promise<CapturedError | null> {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return null;
+    }
+    if (!isPlainObject(parsed)) return null;
+
+    const message = stringField(parsed.message);
+    if (!message) return null;
+
+    const userId = ops.config.currentUserId ? await ops.config.currentUserId(req) : undefined;
+
+    return {
+      type: stringField(parsed.type) ?? "Error",
+      message,
+      stack: stringField(parsed.stack),
+      source: "browser",
+      url: stringField(parsed.url),
+      method: stringField(parsed.method),
+      userId,
+      userRole: stringField(parsed.userRole),
+      requestId: stringField(parsed.requestId),
+      release: stringField(parsed.release),
+      userAgent: stringField(parsed.userAgent) ?? req.headers.get("user-agent") ?? undefined,
+      context: isPlainObject(parsed.context) ? parsed.context : undefined,
+    };
+  }
+
+  /**
+   * POST /ops/api/ingest -- takes no ops session (errors happen to ordinary
+   * and signed-out users, who never have one) and no CSRF token (there is no
+   * session to bind one to). Its only defences are: same-origin, a size cap,
+   * and a per-IP rate limit. Past those three gates this always answers 204,
+   * even when it silently discards a malformed or unstorable report -- a
+   * failing ingest must never surface as an error of its own to a user who is
+   * already looking at a broken page.
+   */
+  async function handleIngest(req: Request): Promise<Response> {
+    if (!isSameOriginIngest(req)) return respond(403);
+
+    const ip = clientIp(req);
+    const gate = ingestLimiter.check(ip);
+    if (!gate.ok) {
+      return respond(429, null, { "Retry-After": String(Math.ceil(gate.retryAfterMs / 1000)) });
+    }
+    ingestLimiter.fail(ip); // Every accepted-so-far request counts against the budget, not just failures.
+
+    const contentLength = req.headers.get("content-length");
+    if (contentLength && Number(contentLength) > MAX_INGEST_BYTES) {
+      return respond(413);
+    }
+
+    let raw: string;
+    try {
+      raw = await req.text();
+    } catch {
+      return respond(204);
+    }
+    if (Buffer.byteLength(raw, "utf8") > MAX_INGEST_BYTES) {
+      return respond(413);
+    }
+
+    try {
+      await ops.ready();
+      const event = await browserEventFromBody(raw, req);
+      if (event) await recordError(ops.pool, event);
+    } catch {
+      // Malformed payload, a resolver that threw, or a storage failure --
+      // discard silently. recordError itself never throws either way; this
+      // guards ops.ready() and the resolver call above it.
+    }
+    return respond(204);
+  }
+
   // Every authenticated route. CSRF is verified for all of them and an unlisted
   // path is rejected before the switch, so a route added to the switch but not
   // to this set fails loudly with a 404 instead of quietly skipping the check.
@@ -200,6 +332,13 @@ export function createHandlers(ops: OpsInstance) {
   async function POST(req: Request): Promise<Response> {
     if (!ops.enabled()) return respond(404);
     const path = subpath(req);
+
+    // Reachable without an ops session, alongside login below -- unlike every
+    // other route it never reaches AUTHENTICATED_PATHS or the CSRF check, and
+    // it parses its own (JSON, not form-urlencoded) body, so it must branch
+    // before the shared `body` parse just below.
+    if (path === "ingest") return handleIngest(req);
+
     const body = new URLSearchParams(await req.text());
 
     if (path === "login") {

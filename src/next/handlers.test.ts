@@ -7,6 +7,8 @@ import { signOpsToken, OPS_COOKIE, OPS_FLASH_COOKIE } from "../server/opsSession
 import { parseCookie } from "../server/cookies";
 import type { OpsUser, OpsUserStore } from "../server/users";
 import { createHandlers, csrfToken, readFlash } from "./handlers";
+import { fingerprint } from "../server/errors/fingerprint";
+import { getErrorGroup, listErrorEvents, listErrorGroups, type ErrorGroupRow } from "../server/errors/store";
 
 import { createTestDatabase } from "../server/testdb";
 
@@ -37,6 +39,15 @@ const { GET, POST } = createHandlers(ops);
 // support" 400 cases.
 const opsNoLink = defineOps({ db: { connectionString: DB_URL }, users: store });
 const { POST: POSTNoLink } = createHandlers(opsNoLink);
+
+// Same DB, configured with a currentUserId resolver — used to prove that a
+// browser-reported error's userId comes from the host's resolver, never from
+// the request body, even when a resolver is available to consult.
+const ops2Resolver = defineOps({
+  db: { connectionString: DB_URL }, users: store,
+  currentUserId: () => "resolved-user-1",
+});
+const { POST: POSTWithUser } = createHandlers(ops2Resolver);
 
 // Same DB, a store that implements hardDelete — used for the delete happy path.
 let deletableRows: OpsUser[];
@@ -110,6 +121,37 @@ function rawForm(path: string, fields: Record<string, string>, cookie?: string, 
     },
     body: new URLSearchParams(fields).toString(),
   });
+}
+
+/**
+ * Builds a request for POST /ops/api/ingest. Defaults to a matching Origin
+ * (`https://app.test`, matching the request URL below) and a minimal valid
+ * JSON body, so most tests only need to override what they're exercising.
+ * Pass `origin: ""` to omit the header entirely (same-origin-refusal tests).
+ */
+function ingestRequest(opts: {
+  body?: Record<string, unknown>; raw?: string; origin?: string; referer?: string; ip?: string;
+} = {}): Request {
+  const headers: Record<string, string> = {
+    "content-type": "application/json",
+    "x-forwarded-for": opts.ip ?? "203.0.113.150",
+  };
+  const origin = opts.origin === undefined ? "https://app.test" : opts.origin;
+  if (origin) headers.origin = origin;
+  if (opts.referer) headers.referer = opts.referer;
+  const body = opts.raw ?? JSON.stringify(opts.body ?? { type: "Error", message: "default ingest message" });
+  return new Request("https://app.test/ops/api/ingest", { method: "POST", headers, body });
+}
+
+/** The ingest write is fire-and-forget; poll instead of assuming a fixed delay. */
+async function waitForGroup(id: string, timeoutMs = 3000): Promise<ErrorGroupRow> {
+  const start = Date.now();
+  for (;;) {
+    const group = await getErrorGroup(ops.pool, id);
+    if (group) return group;
+    if (Date.now() - start > timeoutMs) throw new Error(`group ${id} never appeared within ${timeoutMs}ms`);
+    await new Promise((r) => setTimeout(r, 20));
+  }
 }
 
 /** Pulls the signed flash cookie out of a response and decodes it. */
@@ -378,4 +420,149 @@ test("an audit failure after a successful password reset still returns the flash
   assert.equal(flash!.kind, "password");
   assert.equal(flash!.user, "u1");
   assert.match(flash!.value, /^[A-Za-z0-9]{12,}$/);
+});
+
+// --- POST /ops/api/ingest -----------------------------------------------
+
+test("ingest works without any ops session cookie", async () => {
+  const res = await POST(ingestRequest({
+    ip: "203.0.113.150",
+    body: { type: "Error", message: "no session needed case" },
+  }));
+  assert.equal(res.status, 204);
+  const id = fingerprint({ type: "Error", message: "no session needed case" });
+  const group = await waitForGroup(id);
+  assert.equal(group.source, "browser");
+});
+
+test("ingest refuses a request whose Origin does not match this host", async () => {
+  const res = await POST(ingestRequest({ origin: "https://evil.test", ip: "203.0.113.151" }));
+  assert.equal(res.status, 403);
+});
+
+test("ingest refuses a request with neither Origin nor Referer", async () => {
+  const res = await POST(ingestRequest({ origin: "", ip: "203.0.113.152" }));
+  assert.equal(res.status, 403);
+});
+
+test("ingest accepts a same-origin request identified only by Referer", async () => {
+  const res = await POST(ingestRequest({
+    origin: "", referer: "https://app.test/dashboard", ip: "203.0.113.153",
+    body: { type: "Error", message: "referer-only boom" },
+  }));
+  assert.equal(res.status, 204);
+  const id = fingerprint({ type: "Error", message: "referer-only boom" });
+  await waitForGroup(id);
+});
+
+test("ingest refuses a body over 16KB with 413 and stores nothing", async () => {
+  const big = "x".repeat(20 * 1024);
+  const res = await POST(ingestRequest({
+    ip: "203.0.113.154",
+    body: { type: "Error", message: "oversized ingest case", context: { big } },
+  }));
+  assert.equal(res.status, 413);
+  const groups = await listErrorGroups(ops.pool, { source: "browser" });
+  assert.equal(groups.some((g) => g.message === "oversized ingest case"), false);
+});
+
+test("ingest answers 204 even for malformed JSON, and stores nothing", async () => {
+  const before = await listErrorGroups(ops.pool, { source: "browser" });
+  const res = await POST(ingestRequest({ ip: "203.0.113.155", raw: "{not valid json" }));
+  assert.equal(res.status, 204);
+  const after = await listErrorGroups(ops.pool, { source: "browser" });
+  assert.equal(after.length, before.length);
+});
+
+test("ingest answers 204 even when the body has no usable message, and stores nothing", async () => {
+  const before = await listErrorGroups(ops.pool, { source: "browser" });
+  const res = await POST(ingestRequest({ ip: "203.0.113.156", body: { type: "Error" } }));
+  assert.equal(res.status, 204);
+  const after = await listErrorGroups(ops.pool, { source: "browser" });
+  assert.equal(after.length, before.length);
+});
+
+test("a body-supplied source is always overridden to \"browser\"", async () => {
+  const res = await POST(ingestRequest({
+    ip: "203.0.113.157",
+    body: { type: "Error", message: "source override case", source: "server" },
+  }));
+  assert.equal(res.status, 204);
+  const id = fingerprint({ type: "Error", message: "source override case" });
+  const group = await waitForGroup(id);
+  assert.equal(group.source, "browser");
+});
+
+test("a body-supplied userId is ignored when no resolver is configured", async () => {
+  const res = await POST(ingestRequest({
+    ip: "203.0.113.158",
+    body: { type: "Error", message: "userid ignored case", userId: "attacker-supplied" },
+  }));
+  assert.equal(res.status, 204);
+  const id = fingerprint({ type: "Error", message: "userid ignored case" });
+  const group = await waitForGroup(id);
+  const events = await listErrorEvents(ops.pool, group.id, 1);
+  assert.equal(events[0]!.userId, undefined);
+});
+
+test("a body-supplied userId is ignored even when the host supplies a resolver -- the resolver wins", async () => {
+  const res = await POSTWithUser(ingestRequest({
+    ip: "203.0.113.159",
+    body: { type: "Error", message: "resolver wins case", userId: "attacker-supplied" },
+  }));
+  assert.equal(res.status, 204);
+  const id = fingerprint({ type: "Error", message: "resolver wins case" });
+  const group = await waitForGroup(id);
+  const events = await listErrorEvents(ops.pool, group.id, 1);
+  assert.equal(events[0]!.userId, "resolved-user-1");
+});
+
+test("ingest stores the rest of a well-formed body's fields", async () => {
+  const res = await POST(ingestRequest({
+    ip: "203.0.113.160",
+    body: {
+      type: "TypeError",
+      message: "full-shape ingest case",
+      stack: "TypeError: x\n    at f (/app/src/x.ts:1:1)",
+      url: "https://app.test/some/page?token=secret",
+      release: "abc123",
+      userRole: "WORKER",
+      requestId: "req-1",
+      context: { note: "fine", password: "hunter2" },
+    },
+  }));
+  assert.equal(res.status, 204);
+  const id = fingerprint({
+    type: "TypeError", message: "full-shape ingest case",
+    stack: "TypeError: x\n    at f (/app/src/x.ts:1:1)",
+  });
+  const group = await waitForGroup(id);
+  assert.equal(group.source, "browser");
+  const events = await listErrorEvents(ops.pool, group.id, 1);
+  assert.equal(events[0]!.release, "abc123");
+  assert.equal(events[0]!.userRole, "WORKER");
+  assert.equal(events[0]!.requestId, "req-1");
+  assert.equal(events[0]!.url, "https://app.test/some/page");
+  const ctx = events[0]!.context as Record<string, unknown>;
+  assert.equal(ctx.note, "fine");
+  assert.equal(ctx.password, "<redacted>");
+});
+
+test("ingest rate limits at 20 requests per minute per IP", async () => {
+  const ip = "203.0.113.161";
+  let last: Response | undefined;
+  for (let i = 0; i < 21; i++) {
+    last = await POST(ingestRequest({ ip, body: { type: "Error", message: `rate limit ingest case ${i}` } }));
+  }
+  assert.equal(last!.status, 429);
+  assert.ok(Number(last!.headers.get("retry-after")) > 0);
+});
+
+test("every ingest response still carries noindex and no-store", async () => {
+  const res = await POST(ingestRequest({
+    ip: "203.0.113.162",
+    body: { type: "Error", message: "security headers ingest case" },
+  }));
+  assert.match(res.headers.get("x-robots-tag")!, /noindex/);
+  assert.equal(res.headers.get("cache-control"), "no-store");
 });

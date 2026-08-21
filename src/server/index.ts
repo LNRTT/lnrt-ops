@@ -11,3 +11,4 @@ export {
 } from "./health/index";
 export { checkDb, checkEnv, checkBuild, checkMigrations } from "./health/checks";
 export { opsEnabled, isAllowedEmail, verifyCredentials } from "./gate";
+export { captureError } from "./errors/capture";

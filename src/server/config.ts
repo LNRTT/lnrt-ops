@@ -18,6 +18,15 @@ export type OpsConfig = {
   health?: Check[];
   /** Reports the host's own pending migration ids, when it can. */
   hostPendingMigrations?: () => Promise<string[]>;
+  /**
+   * Resolves the current user's id from the host's own session, for a browser-
+   * reported error arriving at `/ops/api/ingest` — an endpoint that is reachable
+   * without an ops session, so it has no session of its own to read. The endpoint
+   * never trusts a body-supplied `userId`; this resolver is the only source it
+   * will accept one from. Omit it, or return `undefined`, to leave browser-
+   * reported events unattributed.
+   */
+  currentUserId?: (req: Request) => Promise<string | undefined> | string | undefined;
 };
 
 export type OpsInstance = {
