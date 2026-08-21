@@ -192,20 +192,22 @@ function serializeContext(context: Record<string, unknown> | null): string | nul
   return json;
 }
 
-function mapGroupRow(r: {
-  id: string;
-  type: string;
-  message: string;
-  culprit: string;
-  source: string;
-  status: string;
-  first_seen: Date;
-  last_seen: Date;
-  event_count: string | number;
-  stored_count: string | number;
-  last_release: string | null;
-  affected_users: string | number;
-}): ErrorGroupRow {
+function mapGroupRow(
+  r: {
+    id: string;
+    type: string;
+    message: string;
+    culprit: string;
+    source: string;
+    status: string;
+    first_seen: Date;
+    last_seen: Date;
+    event_count: string | number;
+    stored_count: string | number;
+    last_release: string | null;
+  },
+  affectedUsers: number,
+): ErrorGroupRow {
   return {
     id: r.id,
     type: r.type,
@@ -218,7 +220,7 @@ function mapGroupRow(r: {
     eventCount: Number(r.event_count),
     storedCount: Number(r.stored_count),
     lastRelease: r.last_release ?? undefined,
-    affectedUsers: Number(r.affected_users),
+    affectedUsers,
   };
 }
 
@@ -387,13 +389,33 @@ export async function recordError(pool: Pool, e: CapturedError): Promise<void> {
 }
 
 // Shared by listErrorGroups and getErrorGroup so the two never drift apart on
-// what "affected users" means. Correlated against the unaliased outer
-// `ops_error_group` row (see the WHERE-clause `userId` filter below, which
-// does the same) -- counts only NULL-free, *stored* user ids, matching the
-// same honesty tradeoff as `stored_count` itself.
-const AFFECTED_USERS_SELECT =
-  `(SELECT count(DISTINCT e.user_id) FROM ops_error_event e
-      WHERE e.group_id = ops_error_group.id AND e.user_id IS NOT NULL) AS affected_users`;
+// what "affected users" means: distinct, NULL-free `user_id`s among a
+// group's *stored* events -- the same honesty tradeoff as `stored_count`
+// itself (a flood past the hourly store cap can undercount).
+//
+// Deliberately a single query bounded by `group_id = ANY($1)` rather than a
+// correlated subquery run once per outer row. `listErrorGroups` returns up
+// to 500 groups, and each group's `(group_id, at DESC)` index still has to
+// read and de-duplicate every one of that group's events (tens of thousands
+// for a busy group before the 30-day prune catches up) -- doing that once
+// per row turns one render into hundreds of full-group scans. Grouping by
+// `group_id` here does the same dedup work in one pass over exactly the
+// rows that matter, and the caller merges the result back onto the page of
+// groups it already fetched, defaulting a group absent from these results
+// (no attributed users at all) to 0 rather than dropping it.
+async function affectedUsersByGroup(pool: Pool, groupIds: string[]): Promise<Map<string, number>> {
+  const counts = new Map<string, number>();
+  if (groupIds.length === 0) return counts;
+  const { rows } = await pool.query<{ group_id: string; c: string | number }>(
+    `SELECT group_id, count(DISTINCT user_id) AS c
+       FROM ops_error_event
+      WHERE group_id = ANY($1) AND user_id IS NOT NULL
+      GROUP BY group_id`,
+    [groupIds],
+  );
+  for (const r of rows) counts.set(r.group_id, Number(r.c));
+  return counts;
+}
 
 export async function listErrorGroups(pool: Pool, q: ErrorGroupQuery = {}): Promise<ErrorGroupRow[]> {
   const limit = Math.min(Math.max(q.limit ?? 100, 1), 500);
@@ -420,9 +442,12 @@ export async function listErrorGroups(pool: Pool, q: ErrorGroupQuery = {}): Prom
   }
   params.push(limit);
 
+  // One round trip for the page of groups, then exactly one more (below) for
+  // the affected-user counts of exactly those groups -- never one query per
+  // row, regardless of whether `limit` is the default 100 or the clamped
+  // maximum 500. See `affectedUsersByGroup` for why.
   const { rows } = await pool.query(
-    `SELECT id, type, message, culprit, source, status, first_seen, last_seen, event_count, stored_count, last_release,
-            ${AFFECTED_USERS_SELECT}
+    `SELECT id, type, message, culprit, source, status, first_seen, last_seen, event_count, stored_count, last_release
        FROM ops_error_group
        ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
       ORDER BY last_seen DESC
@@ -430,18 +455,29 @@ export async function listErrorGroups(pool: Pool, q: ErrorGroupQuery = {}): Prom
     params,
   );
 
-  return rows.map(mapGroupRow);
+  const affectedUsers = await affectedUsersByGroup(
+    pool,
+    rows.map((r) => r.id as string),
+  );
+  return rows.map((r) => mapGroupRow(r, affectedUsers.get(r.id) ?? 0));
 }
 
 export async function getErrorGroup(pool: Pool, id: string): Promise<ErrorGroupRow | null> {
   const { rows } = await pool.query(
-    `SELECT id, type, message, culprit, source, status, first_seen, last_seen, event_count, stored_count, last_release,
-            ${AFFECTED_USERS_SELECT}
+    `SELECT id, type, message, culprit, source, status, first_seen, last_seen, event_count, stored_count, last_release
        FROM ops_error_group
       WHERE id = $1`,
     [id],
   );
-  return rows[0] ? mapGroupRow(rows[0]) : null;
+  if (!rows[0]) return null;
+  // A single group, so this is still just one extra query (never a
+  // correlated-subquery-per-row problem to begin with) -- reusing
+  // `affectedUsersByGroup` here, rather than a bespoke correlated subquery,
+  // is what keeps this consistent with `listErrorGroups` on exactly what
+  // "affected users" counts and how a userless group is reported (0, not
+  // null or a missing row).
+  const affectedUsers = await affectedUsersByGroup(pool, [id]);
+  return mapGroupRow(rows[0], affectedUsers.get(id) ?? 0);
 }
 
 export async function listErrorEvents(pool: Pool, groupId: string, limit = 50): Promise<ErrorEventRow[]> {

@@ -503,3 +503,87 @@ test("a group with no user-attributed events reports zero affected users, not nu
   const group = await getErrorGroup(pool, id);
   assert.equal(group!.affectedUsers, 0);
 });
+
+// --- fix pass 1: single-round-trip affectedUsers + filter composition ----
+
+// Safety net for the `AFFECTED_USERS_SELECT` per-row correlated subquery
+// being replaced by one batched query across the whole page of groups: three
+// groups in the same `listErrorGroups` call, one with a repeated user, one
+// with two distinct users, one with none at all. A batched rewrite that mixes
+// up which count belongs to which group, or that drops a group with zero
+// attributed users instead of reporting 0, would fail this even though each
+// individual count might look right in isolation.
+test("listErrorGroups computes affectedUsers per group in one batch, without cross-group leakage", async () => {
+  const groupA = makeError("fp1-group-a");
+  const groupB = makeError("fp1-group-b");
+  const groupC = makeError("fp1-group-c");
+
+  // Group A: the same user twice -- must count as 1, not 2.
+  await recordError(pool, { ...groupA, userId: "u-a" });
+  await recordError(pool, { ...groupA, userId: "u-a" });
+
+  // Group B: two distinct users -- must count as 2.
+  await recordError(pool, { ...groupB, userId: "u-b1" });
+  await recordError(pool, { ...groupB, userId: "u-b2" });
+
+  // Group C: every event has a null user id -- must count as 0, and the
+  // group must still show up in the results rather than being dropped by
+  // an inner join / ANY() that only matches groups with a users row.
+  await recordError(pool, groupC);
+  await recordError(pool, groupC);
+
+  const idA = fingerprint(groupA);
+  const idB = fingerprint(groupB);
+  const idC = fingerprint(groupC);
+
+  const groups = await listErrorGroups(pool);
+  const a = groups.find((g) => g.id === idA);
+  const b = groups.find((g) => g.id === idB);
+  const c = groups.find((g) => g.id === idC);
+
+  assert.ok(a && b && c, "all three groups must be present in the page");
+  assert.equal(a!.affectedUsers, 1, "repeated user in the same group must not double count");
+  assert.equal(b!.affectedUsers, 2, "distinct users in the same group must both count");
+  assert.equal(c!.affectedUsers, 0, "a group with no attributed users must report 0, not go missing");
+
+  // getErrorGroup must agree with listErrorGroups on the same groups.
+  assert.equal((await getErrorGroup(pool, idA))!.affectedUsers, 1);
+  assert.equal((await getErrorGroup(pool, idB))!.affectedUsers, 2);
+  assert.equal((await getErrorGroup(pool, idC))!.affectedUsers, 0);
+});
+
+// The earlier "filters combine to an intersection" test above already
+// exercises all four filters together and shows two different single-filter
+// mismatches (source, userId) excluding an otherwise-matching group. This
+// adds the other two: a group that matches on source/since/userId but is
+// excluded purely by `status`, and one excluded purely by `since`.
+test("listErrorGroups filter intersection also excludes on status alone and on since alone", async () => {
+  const matchAll = makeError("fp1-filters-match", { source: "browser", userId: "u-77" });
+  const wrongStatus = makeError("fp1-filters-wrong-status", { source: "browser", userId: "u-77" });
+  await recordError(pool, matchAll);
+  await recordError(pool, wrongStatus);
+  const matchId = fingerprint(matchAll);
+  const wrongStatusId = fingerprint(wrongStatus);
+  await setErrorGroupStatus(pool, wrongStatusId, "ignored");
+
+  const byStatus = await listErrorGroups(pool, {
+    status: "open",
+    source: "browser",
+    since: new Date(Date.now() - 60_000),
+    userId: "u-77",
+  });
+  assert.ok(byStatus.some((g) => g.id === matchId));
+  assert.ok(!byStatus.some((g) => g.id === wrongStatusId), "ignored group must be excluded despite matching the rest");
+
+  const future = new Date(Date.now() + 60_000);
+  const bySince = await listErrorGroups(pool, {
+    status: "open",
+    source: "browser",
+    since: future,
+    userId: "u-77",
+  });
+  assert.ok(
+    !bySince.some((g) => g.id === matchId),
+    "a since filter in the future must exclude an otherwise-matching group",
+  );
+});

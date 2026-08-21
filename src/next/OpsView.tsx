@@ -31,11 +31,25 @@ function one(v: string | string[] | undefined): string {
   return Array.isArray(v) ? (v[0] ?? "") : (v ?? "");
 }
 
-// Opportunistic prune: at most once an hour, per ops instance, and never
-// awaited by a render -- a slow or failing prune must not delay the errors
-// view, let alone break it. Keyed by the `OpsInstance` object's own identity
-// (a WeakMap, so nothing leaks) rather than any global state, so distinct
-// instances -- including two in the same test file -- never share a clock.
+// Opportunistic prune: at most once an hour per `OpsInstance` *in this
+// process*, and never awaited by a render -- a slow or failing prune must
+// not delay the errors view, let alone break it. Keyed by the `OpsInstance`
+// object's own identity (a WeakMap, so nothing leaks) rather than any global
+// state, so distinct instances -- including two in the same test file --
+// never share a clock.
+//
+// That per-process scoping means this is not a system-wide "at most once an
+// hour" ceiling: each horizontally-scaled replica holds its own WeakMap, so
+// several replicas can each independently decide it's their turn and fire a
+// prune within the same hour -- the store can see more than one prune in
+// that window in aggregate. This is harmless rather than merely tolerated:
+// `pruneErrors` only deletes rows already past its cutoff and adjusts
+// `stored_count` to match what it actually removed, so a second, overlapping
+// prune from another replica finds nothing left to delete for the rows the
+// first one already caught and is a no-op, not a double-decrement. What this
+// throttle actually guarantees is "this process's own renders won't trigger
+// a prune query more than once an hour," not "the table gets pruned at most
+// once an hour across the deployment."
 const lastPruneAt = new WeakMap<OpsInstance, number>();
 const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
 
