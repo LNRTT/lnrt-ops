@@ -181,7 +181,10 @@ export function createHandlers(ops: OpsInstance) {
     }
   }
 
-  const MUTATING_PATHS = new Set([
+  // Every authenticated route. CSRF is verified for all of them and an unlisted
+  // path is rejected before the switch, so a route added to the switch but not
+  // to this set fails loudly with a 404 instead of quietly skipping the check.
+  const AUTHENTICATED_PATHS = new Set([
     "logout", "users/create", "users/password", "users/role",
     "users/disable", "users/delete", "users/login-link",
   ]);
@@ -227,12 +230,12 @@ export function createHandlers(ops: OpsInstance) {
     const s = await session(req);
     if (!s) return respond(401, "Not signed in.");
 
-    if (MUTATING_PATHS.has(path)) {
-      const supplied = body.get("csrf") ?? "";
-      const expected = csrfToken(s.email, process.env.OPS_SECRET!);
-      if (!timingSafeStringEqual(supplied, expected)) {
-        return respond(403, "Invalid or missing CSRF token.");
-      }
+    if (!AUTHENTICATED_PATHS.has(path)) return respond(404);
+
+    const supplied = body.get("csrf") ?? "";
+    const expected = csrfToken(s.email, process.env.OPS_SECRET!);
+    if (!timingSafeStringEqual(supplied, expected)) {
+      return respond(403, "Invalid or missing CSRF token.");
     }
 
     await ops.ready();
