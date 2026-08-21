@@ -30,6 +30,7 @@ table.ops-table { width: 100%; border-collapse: collapse; }
 .ops-tag.warn { background: #fdf0d5; color: #6b4b06; }
 .ops-tag.bad { background: #fbe1e1; color: #7d1d1d; }
 .ops-tag.good { background: #e2f1e5; color: #1d5b2c; }
+.ops-tag.neutral { background: #e8eaed; color: #3c4450; }
 .ops-root input, .ops-root select, .ops-root button { font: inherit; padding: 6px 10px;
   border: 1px solid #c8ced6; border-radius: 6px; background: #fff; }
 .ops-root button { background: #1f3a5f; color: #fff; border-color: #1f3a5f; cursor: pointer; font-weight: 600; }
@@ -39,4 +40,7 @@ form.ops-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; ma
   font-family: ui-monospace, monospace; word-break: break-all; }
 .ops-note { color: #6b7784; font-size: 13px; }
 .ops-error { background: #fbe1e1; color: #7d1d1d; padding: 10px 12px; border-radius: 6px; margin-bottom: 12px; }
+.ops-pre { background: #0e1726; color: #d9f2e3; padding: 12px 14px; border-radius: 8px;
+  font-family: ui-monospace, monospace; font-size: 12px; white-space: pre-wrap; word-break: break-word;
+  overflow-x: auto; margin: 8px 0 0; }
 `;

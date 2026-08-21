@@ -32,6 +32,12 @@ export type ErrorGroupRow = {
   eventCount: number;
   storedCount: number;
   lastRelease?: string;
+  /**
+   * Distinct `user_id`s among this group's *stored* events (the hourly cap
+   * means this can undercount a flood the same way `storedCount` does — it
+   * is honest about what was kept, not a claim about every occurrence).
+   */
+  affectedUsers: number;
 };
 
 export type ErrorEventRow = {
@@ -198,6 +204,7 @@ function mapGroupRow(r: {
   event_count: string | number;
   stored_count: string | number;
   last_release: string | null;
+  affected_users: string | number;
 }): ErrorGroupRow {
   return {
     id: r.id,
@@ -211,6 +218,7 @@ function mapGroupRow(r: {
     eventCount: Number(r.event_count),
     storedCount: Number(r.stored_count),
     lastRelease: r.last_release ?? undefined,
+    affectedUsers: Number(r.affected_users),
   };
 }
 
@@ -378,6 +386,15 @@ export async function recordError(pool: Pool, e: CapturedError): Promise<void> {
   }
 }
 
+// Shared by listErrorGroups and getErrorGroup so the two never drift apart on
+// what "affected users" means. Correlated against the unaliased outer
+// `ops_error_group` row (see the WHERE-clause `userId` filter below, which
+// does the same) -- counts only NULL-free, *stored* user ids, matching the
+// same honesty tradeoff as `stored_count` itself.
+const AFFECTED_USERS_SELECT =
+  `(SELECT count(DISTINCT e.user_id) FROM ops_error_event e
+      WHERE e.group_id = ops_error_group.id AND e.user_id IS NOT NULL) AS affected_users`;
+
 export async function listErrorGroups(pool: Pool, q: ErrorGroupQuery = {}): Promise<ErrorGroupRow[]> {
   const limit = Math.min(Math.max(q.limit ?? 100, 1), 500);
   const where: string[] = [];
@@ -404,7 +421,8 @@ export async function listErrorGroups(pool: Pool, q: ErrorGroupQuery = {}): Prom
   params.push(limit);
 
   const { rows } = await pool.query(
-    `SELECT id, type, message, culprit, source, status, first_seen, last_seen, event_count, stored_count, last_release
+    `SELECT id, type, message, culprit, source, status, first_seen, last_seen, event_count, stored_count, last_release,
+            ${AFFECTED_USERS_SELECT}
        FROM ops_error_group
        ${where.length ? `WHERE ${where.join(" AND ")}` : ""}
       ORDER BY last_seen DESC
@@ -417,7 +435,8 @@ export async function listErrorGroups(pool: Pool, q: ErrorGroupQuery = {}): Prom
 
 export async function getErrorGroup(pool: Pool, id: string): Promise<ErrorGroupRow | null> {
   const { rows } = await pool.query(
-    `SELECT id, type, message, culprit, source, status, first_seen, last_seen, event_count, stored_count, last_release
+    `SELECT id, type, message, culprit, source, status, first_seen, last_seen, event_count, stored_count, last_release,
+            ${AFFECTED_USERS_SELECT}
        FROM ops_error_group
       WHERE id = $1`,
     [id],

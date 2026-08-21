@@ -477,3 +477,29 @@ test("pruneErrors keeps a group with no remaining events if it was seen recently
   const group = await getErrorGroup(pool, id);
   assert.ok(group, "a group seen recently must survive even once its events have all aged out");
 });
+
+// --- v0.2 task 4: affected-users count for the errors UI -----------------
+
+test("getErrorGroup and listErrorGroups report the number of distinct affected users", async () => {
+  const err = makeError("affected-users-case");
+  await recordError(pool, { ...err, userId: "u-1" });
+  await recordError(pool, { ...err, userId: "u-2" });
+  await recordError(pool, { ...err, userId: "u-1" }); // repeat -- must not double count
+  await recordError(pool, { ...err }); // no user at all -- must not be counted as a user
+  const id = fingerprint(err);
+
+  const group = await getErrorGroup(pool, id);
+  assert.equal(group!.affectedUsers, 2);
+
+  const groups = await listErrorGroups(pool);
+  const listed = groups.find((g) => g.id === id);
+  assert.equal(listed!.affectedUsers, 2);
+});
+
+test("a group with no user-attributed events reports zero affected users, not null", async () => {
+  const err = makeError("affected-users-none");
+  await recordError(pool, err);
+  const id = fingerprint(err);
+  const group = await getErrorGroup(pool, id);
+  assert.equal(group!.affectedUsers, 0);
+});

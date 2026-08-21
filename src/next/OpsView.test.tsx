@@ -7,6 +7,8 @@ import { signOpsToken, OPS_COOKIE } from "../server/opsSession";
 import type { OpsUser, OpsUserStore, OpsUserQuery } from "../server/users";
 import { OpsView } from "./OpsView";
 import { signFlash } from "./handlers";
+import { recordError, getErrorGroup, setErrorGroupStatus, type CapturedError } from "../server/errors/store";
+import { fingerprint } from "../server/errors/fingerprint";
 
 import { createTestDatabase } from "../server/testdb";
 
@@ -55,6 +57,33 @@ async function renderWith(
 const BROKEN_DB_URL = "postgres://baduser:badpass@127.0.0.1:1/doesnotexist";
 const brokenOps = defineOps({ db: { connectionString: BROKEN_DB_URL }, users: store });
 
+// Error-group fixtures for the errors views below. `label` feeds both the
+// stack frame's filename and the message, so each gets its own fingerprint.
+const ERR_SERVER: CapturedError = {
+  type: "TypeError", message: "boom in checkout", source: "server",
+  stack: "TypeError: boom\n    at checkout (/app/src/checkout.ts:10:5)",
+  userId: "u1", release: "1.2.3",
+};
+const ERR_BROWSER: CapturedError = {
+  type: "RangeError", message: "boom in widget", source: "browser",
+  stack: "RangeError: boom\n    at widget (/app/src/widget.ts:3:1)",
+  userId: "u2", url: "https://app.test/widget?token=SECRETVALUE",
+  context: { note: "safe-context-value", password: "hunter2-should-be-redacted" },
+};
+const ERR_RESOLVED: CapturedError = {
+  type: "Error", message: "already fixed thing", source: "server",
+  stack: "Error: fixed\n    at old (/app/src/old.ts:1:1)",
+  userId: "u3",
+};
+const ERR_OLD: CapturedError = {
+  type: "Error", message: "ancient thing", source: "server",
+  stack: "Error: ancient\n    at ancient (/app/src/ancient.ts:1:1)",
+};
+const SERVER_ID = fingerprint(ERR_SERVER);
+const BROWSER_ID = fingerprint(ERR_BROWSER);
+const RESOLVED_ID = fingerprint(ERR_RESOLVED);
+const OLD_ID = fingerprint(ERR_OLD);
+
 let authCookie: string;
 before(async () => {
   process.env.OPS_ADMIN_EMAILS = "me@lnrt.cz";
@@ -63,6 +92,15 @@ before(async () => {
   await ops.ready();
   await opsWithExtras.ready();
   authCookie = `${OPS_COOKIE}=${await signOpsToken("me@lnrt.cz", SECRET)}`;
+
+  await recordError(ops.pool, ERR_SERVER);
+  await recordError(ops.pool, ERR_BROWSER);
+  await recordError(ops.pool, ERR_RESOLVED);
+  await setErrorGroupStatus(ops.pool, RESOLVED_ID, "resolved");
+  await recordError(ops.pool, ERR_OLD);
+  // Pushed outside the 24h window so the "last 24 hours" filter has
+  // something real to exclude.
+  await ops.pool.query(`UPDATE ops_error_group SET last_seen = now() - interval '2 days' WHERE id = $1`, [OLD_ID]);
 });
 after(async () => {
   await ops.pool.end();
@@ -184,12 +222,156 @@ test("renders the audit and health views", async () => {
   assert.match(health, /Migrations/);
 });
 
+// --- Errors view ----------------------------------------------------------
+
+test("the nav gains an Errors link", async () => {
+  assert.match(await render(["users"], authCookie), /<a href="\/ops\/errors">Errors<\/a>/);
+});
+
+test("the errors list renders groups newest first, with type, message, culprit, count, users, seen dates and release", async () => {
+  const html = await render(["errors"], authCookie);
+  assert.match(html, /TypeError/);
+  assert.match(html, /boom in checkout/);
+  assert.match(html, /checkout\.ts/, "the culprit should be shown");
+  assert.match(html, /1\.2\.3/, "the last release should be shown");
+  // Both the true occurrence count and what was actually kept are shown --
+  // for these fixtures they are equal (1 each), so at minimum the count itself renders.
+  assert.match(html, />1<\/td>/, "an event/affected-user count should render");
+  // ERR_BROWSER was recorded after ERR_SERVER (see the fixtures' `before` block), so its
+  // last_seen is later -- "newest first" means it must appear earlier in the markup.
+  const checkoutIdx = html.indexOf("boom in checkout");
+  const widgetIdx = html.indexOf("boom in widget");
+  assert.ok(checkoutIdx !== -1 && widgetIdx !== -1);
+  assert.ok(widgetIdx < checkoutIdx, "the more-recently-seen group should render first");
+});
+
+test("the errors list honours the unresolved-only filter", async () => {
+  const html = await render(["errors"], authCookie, { unresolved: "1" });
+  assert.match(html, /boom in checkout/);
+  assert.equal(html.includes("already fixed thing"), false, "a resolved group must not show under 'unresolved only'");
+});
+
+test("the errors list honours the source filter", async () => {
+  const server = await render(["errors"], authCookie, { source: "server" });
+  assert.match(server, /boom in checkout/);
+  assert.equal(server.includes("boom in widget"), false, "server filter must exclude the browser-sourced group");
+
+  const browser = await render(["errors"], authCookie, { source: "browser" });
+  assert.match(browser, /boom in widget/);
+  assert.equal(browser.includes("boom in checkout"), false, "browser filter must exclude the server-sourced group");
+});
+
+test("the errors list honours the last-24-hours filter", async () => {
+  const html = await render(["errors"], authCookie, { since: "24h" });
+  assert.match(html, /boom in checkout/);
+  assert.equal(html.includes("ancient thing"), false, "a group not seen in the last 24h must be excluded");
+});
+
+test("the errors list honours the user filter", async () => {
+  const html = await render(["errors"], authCookie, { user: "u1" });
+  assert.match(html, /boom in checkout/);
+  assert.equal(html.includes("boom in widget"), false, "filtering by u1 must exclude a group only u2 hit");
+});
+
+test("the errors list shows no groups when Postgres is unreachable, degrading like every other view", async () => {
+  const el = await OpsView({ ops: brokenOps, path: ["errors"], search: {}, cookieHeader: authCookie });
+  const html = renderToStaticMarkup(el);
+  assert.match(html, /operations database is unavailable/i);
+});
+
+test("an unauthenticated request to the errors list or detail renders none of the error data", async () => {
+  for (const path of [["errors"], ["errors", SERVER_ID]]) {
+    const html = await render(path, undefined);
+    assert.match(html, /action="\/ops\/api\/login"/);
+    assert.equal(html.includes("boom in checkout"), false);
+    assert.equal(html.includes("boom in widget"), false);
+  }
+});
+
+test("the error detail view renders the stack, url, method, release, and redacted context", async () => {
+  const html = await render(["errors", BROWSER_ID], authCookie);
+  assert.match(html, /RangeError/);
+  assert.match(html, /boom in widget/);
+  assert.match(html, /widget\.ts/, "the stack must render");
+  assert.match(html, /\/widget/, "the stored URL (query stripped) must render");
+  assert.equal(html.includes("SECRETVALUE"), false, "the URL's query string must not render");
+  assert.match(html, /safe-context-value/, "a non-sensitive context field must render");
+  assert.equal(html.includes("hunter2-should-be-redacted"), false,
+    "a credential-shaped context field must have been redacted before it ever reached this view");
+});
+
+test("shows 'No such error group.' for an id the store does not have", async () => {
+  const html = await render(["errors", "does-not-exist"], authCookie);
+  assert.match(html, /No such error group\./);
+});
+
+test("the status form on the detail page carries the CSRF token and posts to the errors/status route", async () => {
+  const html = await render(["errors", SERVER_ID], authCookie);
+  assert.match(html, /action="\/ops\/api\/errors\/status"/);
+  const form = html.slice(html.indexOf('action="/ops/api/errors/status"'));
+  const body = form.slice(0, form.indexOf("</form>"));
+  assert.match(body, /name="csrf"/);
+  assert.match(body, new RegExp(`name="id" value="${SERVER_ID}"`));
+});
+
+test("a resolved group's detail page offers to ignore it but not to resolve it again", async () => {
+  const html = await render(["errors", RESOLVED_ID], authCookie);
+  assert.equal(/value="resolved"/.test(html), false, "already resolved -- no redundant resolve action");
+  assert.match(html, /value="ignored"/);
+});
+
+test("the user detail page links to that user's errors", async () => {
+  const html = await render(["users", "u1"], authCookie);
+  assert.match(html, /href="\/ops\/errors\?user=u1"/);
+});
+
+test("the opportunistic prune runs on the first errors-view render, then is throttled for an hour", async () => {
+  const pruneDbUrl = await createTestDatabase("opsview_prune");
+  const pruneOps = defineOps({ db: { connectionString: pruneDbUrl }, users: store });
+  await pruneOps.ready();
+
+  const staleA: CapturedError = {
+    type: "Error", message: "stale a", source: "server",
+    stack: "Error: x\n    at a (/app/src/a.ts:1:1)",
+  };
+  const idA = fingerprint(staleA);
+  await recordError(pruneOps.pool, staleA);
+  await pruneOps.pool.query(`UPDATE ops_error_event SET at = now() - interval '40 days' WHERE group_id = $1`, [idA]);
+  await pruneOps.pool.query(`UPDATE ops_error_group SET last_seen = now() - interval '40 days' WHERE id = $1`, [idA]);
+
+  await renderWith(pruneOps, ["errors"], authCookie);
+
+  const start = Date.now();
+  let goneA = false;
+  while (Date.now() - start < 3000) {
+    if (!(await getErrorGroup(pruneOps.pool, idA))) { goneA = true; break; }
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  assert.ok(goneA, "the first errors-view render should trigger an opportunistic prune");
+
+  const staleB: CapturedError = {
+    type: "Error", message: "stale b", source: "server",
+    stack: "Error: x\n    at b (/app/src/b.ts:1:1)",
+  };
+  const idB = fingerprint(staleB);
+  await recordError(pruneOps.pool, staleB);
+  await pruneOps.pool.query(`UPDATE ops_error_event SET at = now() - interval '40 days' WHERE group_id = $1`, [idB]);
+  await pruneOps.pool.query(`UPDATE ops_error_group SET last_seen = now() - interval '40 days' WHERE id = $1`, [idB]);
+
+  await renderWith(pruneOps, ["errors"], authCookie);
+  await new Promise((r) => setTimeout(r, 200));
+  const stillThere = await getErrorGroup(pruneOps.pool, idB);
+  assert.ok(stillThere, "a second render within the same hour must not run the prune again");
+
+  await pruneOps.pool.end();
+});
+
 test("every posting form carries a CSRF token, and no GET form does", async () => {
   // A GET form serialises its fields into the query string, so a token there
   // would land in browser history, access logs and the Referer header. It is a
   // stable HMAC, so leaking it once weakens every mutation until OPS_SECRET is
   // rotated.
-  for (const path of [["users"], ["users", "u1"]]) {
+  for (const path of [["users"], ["users", "u1"], ["errors"], ["errors", SERVER_ID]]) {
     const html = await render(path, authCookie);
     const forms = html.split("<form").slice(1);
     assert.ok(forms.length > 0, `expected forms on /${path.join("/")}`);

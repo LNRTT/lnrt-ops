@@ -7,8 +7,11 @@ import { parseCookie } from "../server/cookies";
 import { csrfToken, readFlash } from "./handlers";
 import { OPS_COOKIE, OPS_FLASH_COOKIE, verifyOpsToken } from "../server/opsSession";
 import { canHardDelete } from "../server/users";
+import { getErrorGroup, listErrorEvents, listErrorGroups, pruneErrors } from "../server/errors/store";
 import { OPS_STYLES } from "./styles";
 import { Audit } from "./views/Audit";
+import { ErrorDetail } from "./views/ErrorDetail";
+import { Errors } from "./views/Errors";
 import { Health } from "./views/Health";
 import { Login } from "./views/Login";
 import { UserDetail } from "./views/UserDetail";
@@ -28,6 +31,25 @@ function one(v: string | string[] | undefined): string {
   return Array.isArray(v) ? (v[0] ?? "") : (v ?? "");
 }
 
+// Opportunistic prune: at most once an hour, per ops instance, and never
+// awaited by a render -- a slow or failing prune must not delay the errors
+// view, let alone break it. Keyed by the `OpsInstance` object's own identity
+// (a WeakMap, so nothing leaks) rather than any global state, so distinct
+// instances -- including two in the same test file -- never share a clock.
+const lastPruneAt = new WeakMap<OpsInstance, number>();
+const PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+
+function maybePruneErrors(ops: OpsInstance): void {
+  const now = Date.now();
+  if (now - (lastPruneAt.get(ops) ?? 0) < PRUNE_INTERVAL_MS) return;
+  // Marked before the write resolves -- a second render arriving while the
+  // first prune is still in flight must not queue a second one.
+  lastPruneAt.set(ops, now);
+  void pruneErrors(ops.pool).catch((err) => {
+    console.error("[ops] opportunistic error prune failed", err);
+  });
+}
+
 function Shell({ csrf, children }: { csrf: string; children: ReactNode }) {
   return (
     <div className="ops-root">
@@ -39,6 +61,7 @@ function Shell({ csrf, children }: { csrf: string; children: ReactNode }) {
       <div className="ops-shell">
         <nav className="ops-nav">
           <a href="/ops/users">Users</a>
+          <a href="/ops/errors">Errors</a>
           <a href="/ops/audit">Audit</a>
           <a href="/ops/health">Health</a>
           <span className="ops-spacer" />
@@ -99,6 +122,36 @@ export async function OpsView({ ops, path, search, cookieHeader }: OpsViewProps)
 
   if (path[0] === "audit") {
     return <Shell csrf={csrf}><Audit rows={await listAudit(ops.pool, { limit: 200 })} /></Shell>;
+  }
+
+  if (path[0] === "errors") {
+    // Fire-and-forget, at most once an hour -- must never delay this render
+    // or take the page down if it fails.
+    maybePruneErrors(ops);
+
+    if (path[1]) {
+      const group = await getErrorGroup(ops.pool, path[1]);
+      if (!group) return <Shell csrf={csrf}><div className="ops-card">No such error group.</div></Shell>;
+      const events = await listErrorEvents(ops.pool, path[1], 50);
+      return <Shell csrf={csrf}><ErrorDetail group={group} events={events} csrf={csrf} /></Shell>;
+    }
+
+    const unresolved = one(search.unresolved) === "1";
+    const since24h = one(search.since) === "24h";
+    const sourceParam = one(search.source);
+    const source = sourceParam === "server" || sourceParam === "browser" ? sourceParam : "";
+    const userId = one(search.user) || undefined;
+    const groups = await listErrorGroups(ops.pool, {
+      status: unresolved ? "open" : undefined,
+      source: source || undefined,
+      since: since24h ? new Date(Date.now() - 24 * 60 * 60 * 1000) : undefined,
+      userId,
+    });
+    return (
+      <Shell csrf={csrf}>
+        <Errors groups={groups} unresolved={unresolved} since24h={since24h} source={source} userId={userId} />
+      </Shell>
+    );
   }
 
   if (path[0] === "users" && path[1]) {

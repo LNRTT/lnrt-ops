@@ -8,7 +8,9 @@ import { parseCookie } from "../server/cookies";
 import type { OpsUser, OpsUserStore } from "../server/users";
 import { createHandlers, csrfToken, readFlash } from "./handlers";
 import { fingerprint } from "../server/errors/fingerprint";
-import { getErrorGroup, listErrorEvents, listErrorGroups, type ErrorGroupRow } from "../server/errors/store";
+import {
+  getErrorGroup, listErrorEvents, listErrorGroups, recordError, type CapturedError, type ErrorGroupRow,
+} from "../server/errors/store";
 
 import { createTestDatabase } from "../server/testdb";
 
@@ -461,6 +463,58 @@ test("an audit failure after a successful password reset still returns the flash
   assert.equal(flash!.kind, "password");
   assert.equal(flash!.user, "u1");
   assert.match(flash!.value, /^[A-Za-z0-9]{12,}$/);
+});
+
+// --- POST /ops/api/errors/status ------------------------------------------
+
+const ERR_FOR_STATUS: CapturedError = {
+  type: "TypeError", message: "status route boom", source: "server",
+  stack: "TypeError: boom\n    at statusRoute (/app/src/statusRoute.ts:1:1)",
+};
+const STATUS_GROUP_ID = fingerprint(ERR_FOR_STATUS);
+
+test("errors/status marks a group resolved and audits it", async () => {
+  await recordError(ops.pool, ERR_FOR_STATUS);
+  const res = await POST(form("errors/status", { id: STATUS_GROUP_ID, status: "resolved" }, authCookie));
+  assert.equal(res.status, 303);
+  const group = await getErrorGroup(ops.pool, STATUS_GROUP_ID);
+  assert.equal(group!.status, "resolved");
+  const audits = await listAudit(ops.pool, { limit: 5 });
+  assert.ok(audits.some((a) => a.action === "error.status" && a.targetId === STATUS_GROUP_ID),
+    "marking a group resolved must be audited");
+});
+
+test("errors/status marks a group ignored", async () => {
+  const res = await POST(form("errors/status", { id: STATUS_GROUP_ID, status: "ignored" }, authCookie));
+  assert.equal(res.status, 303);
+  const group = await getErrorGroup(ops.pool, STATUS_GROUP_ID);
+  assert.equal(group!.status, "ignored");
+});
+
+test("errors/status rejects an unknown status value, with no write", async () => {
+  const before = (await getErrorGroup(ops.pool, STATUS_GROUP_ID))!.status;
+  const res = await POST(form("errors/status", { id: STATUS_GROUP_ID, status: "deleted" }, authCookie));
+  assert.equal(res.status, 400);
+  const after = (await getErrorGroup(ops.pool, STATUS_GROUP_ID))!.status;
+  assert.equal(after, before);
+});
+
+test("errors/status 404s for an unknown group id, with no write", async () => {
+  const res = await POST(form("errors/status", { id: "does-not-exist", status: "resolved" }, authCookie));
+  assert.equal(res.status, 404);
+});
+
+test("errors/status requires a session", async () => {
+  const res = await POST(form("errors/status", { id: STATUS_GROUP_ID, status: "resolved" }));
+  assert.equal(res.status, 401);
+});
+
+test("errors/status is refused without a valid CSRF token, with no write", async () => {
+  const before = (await getErrorGroup(ops.pool, STATUS_GROUP_ID))!.status;
+  const res = await POST(rawForm("errors/status", { id: STATUS_GROUP_ID, status: "resolved" }, authCookie));
+  assert.equal(res.status, 403);
+  const after = (await getErrorGroup(ops.pool, STATUS_GROUP_ID))!.status;
+  assert.equal(after, before);
 });
 
 // --- POST /ops/api/ingest -----------------------------------------------

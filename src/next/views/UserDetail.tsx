@@ -14,6 +14,7 @@ export function UserDetail({
           Role {user.role} · {user.disabled ? "disabled" : "active"} ·{" "}
           {user.hasPassword ? "password set" : "no password set"}
         </p>
+        <p><a href={`/ops/errors?user=${user.id}`}>View errors reported for this user</a></p>
       </div>
 
       {reveal && (

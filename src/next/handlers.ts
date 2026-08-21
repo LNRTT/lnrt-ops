@@ -2,7 +2,7 @@ import { createHmac, timingSafeEqual } from "node:crypto";
 import { writeAudit } from "../server/audit";
 import type { OpsInstance } from "../server/config";
 import { parseCookie, serializeCookie } from "../server/cookies";
-import { recordError, type CapturedError } from "../server/errors/store";
+import { getErrorGroup, recordError, setErrorGroupStatus, type CapturedError } from "../server/errors/store";
 import { isAllowedEmail, verifyCredentials } from "../server/gate";
 import { runChecks } from "../server/health/index";
 import {
@@ -301,10 +301,12 @@ export function createHandlers(ops: OpsInstance) {
     return new URL(req.url).pathname.replace(/^\/ops\/api\/?/, "");
   }
 
-  async function audit(req: Request, actor: string, action: string, summary: string, targetId?: string) {
+  async function audit(
+    req: Request, actor: string, action: string, summary: string, targetId?: string, targetType = "user",
+  ) {
     await writeAudit(ops.pool, {
       actor: truncate(actor), action, summary,
-      targetType: targetId ? "user" : undefined, targetId,
+      targetType: targetId ? targetType : undefined, targetId,
       ip: truncate(clientIp(req)),
       userAgent: req.headers.get("user-agent") ? truncate(req.headers.get("user-agent")!) : undefined,
     });
@@ -313,10 +315,10 @@ export function createHandlers(ops: OpsInstance) {
   /** Audits an action that has already taken effect — a failure here must not read as "nothing happened". */
   async function auditApplied(
     req: Request, actor: string, action: string, summary: string,
-    targetId: string | undefined, extraHeaders: Record<string, string | string[]> = {},
+    targetId: string | undefined, extraHeaders: Record<string, string | string[]> = {}, targetType = "user",
   ): Promise<void> {
     try {
-      await audit(req, actor, action, summary, targetId);
+      await audit(req, actor, action, summary, targetId, targetType);
     } catch {
       throw new AppliedButNotRecorded(extraHeaders);
     }
@@ -464,7 +466,7 @@ export function createHandlers(ops: OpsInstance) {
   // to this set fails loudly with a 404 instead of quietly skipping the check.
   const AUTHENTICATED_PATHS = new Set([
     "logout", "users/create", "users/password", "users/role",
-    "users/disable", "users/delete", "users/login-link",
+    "users/disable", "users/delete", "users/login-link", "errors/status",
   ]);
 
   async function POST(req: Request): Promise<Response> {
@@ -628,6 +630,21 @@ export function createHandlers(ops: OpsInstance) {
           const flash = flashCookie(req, { kind: "link", user: id, value: `${ops.config.loginLink.path}/${token}` });
           await auditApplied(req, s.email, "user.login-link", "Minted a sign-in link", id, { "Set-Cookie": flash });
           return redirect(`${base}/users/${id}`, { "Set-Cookie": flash });
+        }
+
+        case "errors/status": {
+          const raw = body.get("status");
+          if (raw !== "resolved" && raw !== "ignored") {
+            return respond(400, 'The "status" field must be exactly "resolved" or "ignored".');
+          }
+          if (!(await getErrorGroup(ops.pool, id))) return respond(404, "No such error group.");
+          await setErrorGroupStatus(ops.pool, id, raw);
+          // The group id is a fingerprint hash, not attacker-supplied text --
+          // unlike its type/message/stack, it is safe to write straight into
+          // the audit summary; an operator can look the id up on the errors
+          // page for the full, redacted detail.
+          await auditApplied(req, s.email, "error.status", `Marked error group ${id} as ${raw}`, id, {}, "error");
+          return redirect(`${base}/errors/${id}`);
         }
 
         default:
