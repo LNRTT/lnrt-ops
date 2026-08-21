@@ -1,0 +1,32 @@
+{
+  "name": "@lnrt/ops",
+  "version": "0.1.0",
+  "private": false,
+  "type": "module",
+  "engines": { "node": ">=22" },
+  "files": ["dist"],
+  "exports": {
+    "./server": { "types": "./dist/server/index.d.ts", "default": "./dist/server/index.js" },
+    "./next": { "types": "./dist/next/index.d.ts", "default": "./dist/next/index.js" }
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/**/*.test.ts",
+    "prepare": "npm run build"
+  },
+  "dependencies": { "pg": "^8.20.0", "bcryptjs": "^3.0.3", "jose": "^6.2.2" },
+  "peerDependencies": { "next": ">=16", "react": ">=19", "react-dom": ">=19" },
+  "devDependencies": {
+    "typescript": "^7.0.2",
+    "tsx": "^4.23.12",
+    "tsup": "^8.5.1",
+    "@types/node": "^26.2.0",
+    "@types/pg": "^8.23.1",
+    "@types/bcryptjs": "^2.4.6",
+    "@types/react": "^19.2.18",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "next": "^16.3.2"
+  }
+}
