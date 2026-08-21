@@ -76,6 +76,16 @@ test("shows the login form when there is no session", async () => {
   assert.equal(html.includes("anna@b.cz"), false, "no user data before signing in");
 });
 
+test("the login form can reveal the password", async () => {
+  // A password manager filling the wrong entry is indistinguishable from a
+  // broken gate unless the operator can see the field.
+  const html = await render([]);
+  assert.match(html, /id="ops-pw"/);
+  assert.match(html, /id="ops-pw-show"/);
+  assert.match(html, /Show password/);
+  assert.match(html, /field\.type = box\.checked/, "the toggle must actually be wired up");
+});
+
 test("lists users once signed in, marking disabled and password-less accounts", async () => {
   const html = await render(["users"], authCookie);
   assert.match(html, /anna@b\.cz/);
