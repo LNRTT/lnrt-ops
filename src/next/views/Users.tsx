@@ -19,10 +19,6 @@ export function Users({
       <div className="ops-card">
         <h2>Users ({total})</h2>
         <form className="ops-row" method="get" action="/ops/users">
-          {/* This is a GET navigation, not a POST /ops/api/* mutation, so the
-              server never checks this field — it is here only so every form on
-              the page carries one, keeping the invariant simple to state and test. */}
-          <input type="hidden" name="csrf" value={csrf} />
           <input name="q" placeholder="Search name or email" defaultValue={query} />
           <label><input type="checkbox" name="disabled" value="1" /> include disabled</label>
           <button type="submit">Search</button>

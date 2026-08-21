@@ -71,13 +71,23 @@ test("renders the audit and health views", async () => {
   assert.match(health, /Migrations/);
 });
 
-test("every form carries a CSRF token", async () => {
+test("every posting form carries a CSRF token, and no GET form does", async () => {
+  // A GET form serialises its fields into the query string, so a token there
+  // would land in browser history, access logs and the Referer header. It is a
+  // stable HMAC, so leaking it once weakens every mutation until OPS_SECRET is
+  // rotated.
   for (const path of [["users"], ["users", "u1"]]) {
     const html = await render(path, authCookie);
     const forms = html.split("<form").slice(1);
     assert.ok(forms.length > 0, `expected forms on /${path.join("/")}`);
     for (const form of forms) {
-      assert.match(form, /name="csrf"/, `a form on /${path.join("/")} has no CSRF token`);
+      const body = form.slice(0, form.indexOf("</form>"));
+      if (/method="post"/.test(body)) {
+        assert.match(body, /name="csrf"/, `a posting form on /${path.join("/")} has no CSRF token`);
+      } else {
+        assert.equal(/name="csrf"/.test(body), false,
+          `a GET form on /${path.join("/")} must not leak the CSRF token into the query string`);
+      }
     }
   }
 });
