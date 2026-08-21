@@ -5,6 +5,9 @@ export {
   generatePassword, canHardDelete, resetPassword,
 } from "./users";
 export { writeAudit, listAudit, type AuditInput, type AuditRow } from "./audit";
-export { runChecks, type Check, type CheckResult, type CheckStatus } from "./health/index";
+export {
+  runChecks,
+  type Check, type CheckContext, type CheckOutcome, type CheckResult, type CheckStatus,
+} from "./health/index";
 export { checkDb, checkEnv, checkBuild, checkMigrations } from "./health/checks";
 export { opsEnabled, isAllowedEmail, verifyCredentials } from "./gate";

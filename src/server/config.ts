@@ -37,9 +37,20 @@ export function defineOps(config: OpsConfig): OpsInstance {
     config,
     pool,
     ready() {
-      readyPromise ??= migrate(pool, ALL_MIGRATIONS)
-        .then(() => undefined)
-        .catch((err) => { readyPromise = null; throw err; });
+      if (!readyPromise) {
+        readyPromise = migrate(pool, ALL_MIGRATIONS)
+          .then(() => undefined)
+          .catch((err) => {
+            // Clear it so the next caller retries. A database that was
+            // unreachable once must not poison the instance forever.
+            readyPromise = null;
+            throw err;
+          });
+        // Mark the stored promise handled. Callers still receive the rejection
+        // through the promise they are returned; this only stops a
+        // fire-and-forget `void ops.ready()` from killing the process.
+        readyPromise.catch(() => {});
+      }
       return readyPromise;
     },
     enabled() { return opsEnabled(); },

@@ -1,5 +1,9 @@
 import { test, after } from "node:test";
 import assert from "node:assert/strict";
+import { Pool } from "pg";
+// Aliased: the module-level `URL` constant below (a connection string) shadows
+// the global URL constructor for the rest of this file.
+import { URL as NodeURL } from "node:url";
 import bcrypt from "bcryptjs";
 import { defineOps } from "./config";
 import type { OpsUserStore } from "./users";
@@ -46,9 +50,35 @@ test("checks() always includes the built-ins and appends custom ones", () => {
   assert.ok(ids.includes("storage"));
 });
 
-test("a failed migration is remembered so ready() surfaces it every time", async () => {
-  const broken = defineOps({ db: { connectionString: "postgres://nobody@127.0.0.1:1/none" }, users });
-  await assert.rejects(() => broken.ready());
-  await assert.rejects(() => broken.ready(), "must not cache a rejected promise as success");
-  await broken.pool.end().catch(() => {});
+test("a failed ready() is retried rather than cached", async () => {
+  // Point at a database that does not exist yet, then create it between the two
+  // calls. A cached rejection would fail the second call too, so this
+  // distinguishes a real retry from a poisoned promise — which asserting
+  // "rejects twice" against a permanently dead address cannot do.
+  const base = new NodeURL(process.env.OPS_TEST_DATABASE_URL!);
+  const dbName = "ops_test_config_retry";
+  const admin = new Pool({ connectionString: base.toString(), max: 1 });
+  try {
+    await admin.query(`DROP DATABASE IF EXISTS ${dbName} WITH (FORCE)`);
+
+    base.pathname = `/${dbName}`;
+    const late = defineOps({ db: { connectionString: base.toString() }, users });
+
+    try {
+      await assert.rejects(() => late.ready(), "the database does not exist yet");
+
+      await admin.query(`CREATE DATABASE ${dbName}`);
+
+      await late.ready();
+      const { rows } = await late.pool.query("SELECT to_regclass('ops_audit_log') AS t");
+      assert.notEqual(rows[0].t, null, "the retry must have actually run the migrations");
+    } finally {
+      await late.pool.end();
+    }
+  } finally {
+    // Drop the database we created so a rerun (or another test file) never
+    // collides with it, and so it doesn't linger in the test cluster.
+    await admin.query(`DROP DATABASE IF EXISTS ${dbName} WITH (FORCE)`);
+    await admin.end();
+  }
 });
