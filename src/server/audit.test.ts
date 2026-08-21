@@ -4,13 +4,12 @@ import { Pool } from "pg";
 import { migrate } from "./migrate";
 import { ALL_MIGRATIONS } from "./migrations/index";
 import { writeAudit, listAudit } from "./audit";
+import { createTestDatabase } from "./testdb";
 
-const URL = process.env.OPS_TEST_DATABASE_URL!;
 let pool: Pool;
 
 before(async () => {
-  pool = new Pool({ connectionString: URL });
-  await pool.query("DROP TABLE IF EXISTS ops_audit_log; DELETE FROM ops_migration WHERE id = '001-init'");
+  pool = new Pool({ connectionString: await createTestDatabase("audit") });
   await migrate(pool, ALL_MIGRATIONS);
 });
 after(async () => { await pool.end(); });

@@ -2,9 +2,7 @@ import { test, before, after } from "node:test";
 import assert from "node:assert/strict";
 import { Pool } from "pg";
 import { migrate, pendingMigrations, type Migration } from "./migrate";
-
-const URL = process.env.OPS_TEST_DATABASE_URL;
-if (!URL) throw new Error("OPS_TEST_DATABASE_URL is not set — see the plan's Global Constraints");
+import { createTestDatabase } from "./testdb";
 
 let pool: Pool;
 const FIXTURES: Migration[] = [
@@ -13,8 +11,8 @@ const FIXTURES: Migration[] = [
 ];
 
 before(async () => {
-  pool = new Pool({ connectionString: URL });
-  await pool.query("DROP TABLE IF EXISTS ops_probe; DROP TABLE IF EXISTS ops_migration");
+  // Own database, created empty — no cleanup preamble needed.
+  pool = new Pool({ connectionString: await createTestDatabase("migrate") });
 });
 after(async () => { await pool.end(); });
 
