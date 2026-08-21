@@ -6,17 +6,128 @@ self-applying Postgres schema.
 
 ## Status
 
-Early scaffold. This package currently ships:
+v0.1.0. This package ships two entry points:
 
-- `getPool(connectionString)` — one pooled `pg.Pool` per connection string, reused
-  across hot reloads and requests.
-- `migrate(pool, migrations)` / `pendingMigrations(pool, migrations)` — an
-  advisory-locked SQL migrator. Migrations are plain TypeScript modules that export
-  SQL strings (never files read from disk at runtime, since the package ships
-  bundled), applied in order, each in its own transaction.
-- `ALL_MIGRATIONS` — the package's own schema history, starting with `ops_audit_log`.
+- `@lnrt/ops/server` — `defineOps()`, the Postgres pool/migrator, the access gate,
+  the audit log, health checks, and the `OpsUserStore` contract plus its Prisma
+  adapter (`prismaUserStore`).
+- `@lnrt/ops/next` — `OpsPage` (the catch-all page component), `OpsView` (the pure,
+  Next.js-free renderer it delegates to), and `createHandlers()` (the `/ops/api/*`
+  route handlers for `GET`/`POST`).
 
-The gate, user administration, audit log, health checks and UI land in later tasks.
+Together they cover: sign-in gated by an allowlist of emails and a single bcrypt
+password, a user list and detail view (password reset, role change, disable/restore,
+optional hard delete, optional one-time sign-in links), an audit log, and a health
+page (database reachability, required environment variables, build info, pending
+migrations, plus any project-specific checks). All mutations are plain
+`<form method="post">` posts — there is no client-side JavaScript in v0.1.
+
+Deferred to a later version, deliberately: impersonation, session listing/revocation,
+a dedicated error view, an activity feed, and runtime settings.
+
+## Integration
+
+Mounting `/ops` in a host Next.js app takes three files.
+
+**1. Configure the instance** (`src/lib/ops.ts`):
+
+```ts
+import "server-only";
+import { defineOps, prismaUserStore } from "@lnrt/ops/server";
+import bcrypt from "bcryptjs";
+import { mintInvite } from "@/lib/invites"; // your own one-time-token minter
+import { prisma } from "@/lib/prisma";
+
+export const ops = defineOps({
+  db: { connectionString: process.env.DATABASE_URL! },
+  users: prismaUserStore(prisma, {
+    model: "user",
+    roles: ["WORKER", "ADMIN"],
+    hashPassword: (plaintext) => bcrypt.hash(plaintext, 10),
+    // Omit hardDelete (the adapter option, or implement your own OpsUserStore
+    // without the method) to hide the delete button — see "The OpsUserStore
+    // contract" below.
+  }),
+  // Optional: mint a one-time sign-in link instead of (or alongside) a password.
+  loginLink: { mint: mintInvite, path: "/invite" },
+  // Optional: env vars the health page should confirm are present.
+  requiredEnv: ["DATABASE_URL", "SESSION_SECRET"],
+  // Optional: extra checks appended to the built-in ones.
+  health: [],
+});
+```
+
+**2. The page** (`src/app/ops/[[...path]]/page.tsx`):
+
+```tsx
+import { OpsPage } from "@lnrt/ops/next";
+import { ops } from "@/lib/ops";
+
+export const dynamic = "force-dynamic";
+
+export default function Page(props: {
+  params: Promise<{ path?: string[] }>;
+  searchParams: Promise<Record<string, string | string[] | undefined>>;
+}) {
+  return <OpsPage ops={ops} {...props} />;
+}
+```
+
+**3. The API routes** (`src/app/ops/api/[[...path]]/route.ts`):
+
+```ts
+import { createHandlers } from "@lnrt/ops/next";
+import { ops } from "@/lib/ops";
+
+export const dynamic = "force-dynamic";
+export const { GET, POST } = createHandlers(ops);
+```
+
+## Environment variables
+
+| Variable | Required | Purpose |
+|---|---|---|
+| `OPS_ADMIN_EMAILS` | Yes | Comma-separated allowlist of the only emails that can sign in. |
+| `OPS_PASSWORD_HASH` | Yes | A bcrypt hash of the single ops password, checked in constant time against every allowed email. |
+| `OPS_SECRET` | Yes | >= 32 characters. Signs the session cookie, the CSRF token and the one-time flash cookie. |
+| `OPS_RELEASE` | No | Shown on the health page's Build check. Falls back to `GIT_SHA`, then `SOURCE_COMMIT`, then `unknown`. |
+
+Any of `OPS_ADMIN_EMAILS`, `OPS_PASSWORD_HASH` or `OPS_SECRET` missing or malformed
+(a non-bcrypt `OPS_PASSWORD_HASH`, a short `OPS_SECRET`) disables the whole module —
+`/ops` and `/ops/api/*` both return a plain 404. Closed by default, never a weakened
+gate.
+
+Generate `OPS_PASSWORD_HASH` with:
+
+```bash
+node -e "console.log(require('bcryptjs').hashSync(process.argv[1],10))" 'your password'
+```
+
+## The `OpsUserStore` contract
+
+The one interface a host project must satisfy to plug its own user table into the
+portal (`src/server/users.ts`):
+
+```ts
+type OpsUserStore = {
+  roles: string[];
+  list(q: OpsUserQuery): Promise<{ users: OpsUser[]; total: number }>;
+  get(id: string): Promise<OpsUser | null>;
+  create(input: { email: string; name: string; role: string }): Promise<OpsUser>;
+  setPassword(id: string, plaintext: string): Promise<void>;
+  setRole(id: string, role: string): Promise<void>;
+  setDisabled(id: string, disabled: boolean): Promise<void>;
+  hardDelete?(id: string): Promise<void>;
+};
+```
+
+Six methods are required; `hardDelete` is the seventh and is optional **on purpose**.
+Omit it wherever user rows are referenced by domain data (time entries, purchases,
+tool holdings, …) that a hard delete would either fail against or silently destroy —
+the "Delete permanently" form in the user detail view only renders when
+`typeof store.hardDelete === "function"`. `@lnrt/ops/server` ships `prismaUserStore()`,
+a ready-made adapter over a Prisma model; implement `OpsUserStore` directly for any
+other storage layer.
 
 ## Design constraints
 
