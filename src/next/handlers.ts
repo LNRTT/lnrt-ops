@@ -24,6 +24,16 @@ const loginLimiter = makeRateLimiter({ limit: 5, windowMs: 15 * 60_000, blockMs:
 // never eat into (or be eaten by) the login lockout's own budget.
 const ingestLimiter = makeRateLimiter({ limit: 20, windowMs: 60_000, blockMs: 60_000 });
 
+// Backstop for the per-IP limiter above: an attacker who rotates edges (or
+// reaches the origin directly, bypassing any proxy that would normally set
+// cf-connecting-ip/x-real-ip) can still mint a fresh clientIp() identity per
+// request, and 20/minute *per identity* has no ceiling in aggregate. This
+// single shared key bounds the whole endpoint regardless of how many
+// distinct source addresses are behind the flood.
+const INGEST_GLOBAL_LIMIT = 600;
+const globalIngestLimiter = makeRateLimiter({ limit: INGEST_GLOBAL_LIMIT, windowMs: 60_000, blockMs: 60_000 });
+const GLOBAL_INGEST_KEY = "*";
+
 // Real request bodies from a browser's own error/rejection handlers are a few
 // hundred bytes; 16 KB leaves headroom for a large stack or context object
 // without letting the endpoint become a place to dump arbitrary data.
@@ -44,6 +54,13 @@ function stringField(value: unknown): string | undefined {
  * any page on the internet POSTing arbitrary "error reports" into the store.
  * Neither header present is refused, not allowed: there is nothing to verify
  * same-origin-ness against.
+ *
+ * What this is NOT: a general-purpose defence. A real browser cannot be made
+ * to lie about `Origin`, which is what stops a drive-by cross-site POST from
+ * a page a victim happens to have open -- but nothing stops a non-browser
+ * client from setting whatever `Origin` it likes; `curl -H 'Origin:
+ * https://this-host'` sails straight through. The size cap and rate limits
+ * below are what actually bound a client that isn't playing by browser rules.
  */
 function isSameOriginIngest(req: Request): boolean {
   const host = new URL(req.url).host;
@@ -76,11 +93,79 @@ function truncate(value: string): string {
   return value.slice(0, AUDIT_FIELD_MAX);
 }
 
+/**
+ * Reads a request body as a stream, aborting the instant the accumulated
+ * byte count passes `maxBytes` -- unlike `await req.text()`, which buffers
+ * the entire body before anything can measure it. A chunked POST with no
+ * `Content-Length` (or one that simply lies about it) has no other limit at
+ * all in an App Router route handler; a handful of concurrent multi-hundred-
+ * megabyte bodies is enough to OOM-kill the whole container. `req.body`
+ * missing (no body at all) is treated as an empty body, not an error.
+ *
+ * Returns `{ ok: false }` the moment the cap is passed -- the stream is
+ * cancelled immediately rather than drained, so the rest of an oversized
+ * body is never read off the wire by this process at all. A genuine
+ * mid-stream read error (a dropped connection, not a cap trip) resolves to
+ * an empty body rather than rejecting, matching the old `req.text()` catch
+ * this replaces: a failing ingest must never surface as an error.
+ */
+async function readCappedBody(req: Request, maxBytes: number): Promise<{ ok: true; text: string } | { ok: false }> {
+  if (!req.body) return { ok: true, text: "" };
+
+  const reader = req.body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (!value) continue;
+      total += value.byteLength;
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => {});
+        return { ok: false };
+      }
+      chunks.push(value);
+    }
+  } catch {
+    return { ok: true, text: "" };
+  }
+  return { ok: true, text: Buffer.concat(chunks.map((c) => Buffer.from(c))).toString("utf8") };
+}
+
+/**
+ * Shared by both rate limiters (`loginLimiter` and `ingestLimiter`) and by
+ * the audit log -- one helper, every call site, so a fix here does not need
+ * a second copy applied somewhere else.
+ *
+ * Prefers `cf-connecting-ip`, then `x-real-ip`, then the last `x-forwarded-
+ * for` hop, in that order. The old last-XFF-hop-only behaviour was wrong in
+ * both directions behind Cloudflare: it is Cloudflare's own edge address,
+ * not the visitor's, so (a) every real visitor sharing one edge collapsed
+ * into a single bucket -- during a genuine incident, the 21st distinct
+ * report in a minute from *different* people got dropped -- and (b) an
+ * attacker could still rotate edges, or reach the origin directly and set
+ * whatever `x-forwarded-for` they liked, for a fresh identity every time.
+ * `cf-connecting-ip`/`x-real-ip` are set by the edge/proxy itself rather
+ * than copied client-by-client along a hop chain, so they resist (b) the
+ * same way the old code intended the last XFF hop to.
+ *
+ * This does not, by itself, stop an attacker who reaches the origin
+ * directly (bypassing Cloudflare, so neither header is set) from forging
+ * `x-forwarded-for` -- that is what the process-wide ingest ceiling
+ * (`globalIngestLimiter`) exists to bound.
+ *
+ * No forwarding header at all collapses onto the single string "unknown" --
+ * acceptable (this only happens direct-to-origin in practice, and even then
+ * the global ceiling still applies), but worth noting: every such caller
+ * then shares one limiter bucket and one audit-log identity.
+ */
 function clientIp(req: Request): string {
+  const cf = req.headers.get("cf-connecting-ip")?.trim();
+  if (cf) return cf;
+  const real = req.headers.get("x-real-ip")?.trim();
+  if (real) return real;
   const hops = (req.headers.get("x-forwarded-for") ?? "").split(",").map((h) => h.trim()).filter(Boolean);
-  // The last hop is the one our own proxy appended; earlier entries are
-  // client-supplied and forgeable, so keying the limiter (or the audit log)
-  // on them lets an attacker mint a fresh identity per request.
   return hops.at(-1) || "unknown";
 }
 
@@ -237,6 +322,22 @@ export function createHandlers(ops: OpsInstance) {
     }
   }
 
+  // `browserEventFromBody` runs on every well-formed body, for anonymous
+  // traffic -- a `currentUserId` that throws must not be allowed to fail
+  // silently forever (the previous catch-and-discard around the whole
+  // function swallowed it with no log at all). Logged once per handlers
+  // instance rather than once per process: two different hosts sharing this
+  // module in one test run (or, in principle, one process) each get their
+  // own signal that their own resolver is broken.
+  let currentUserIdWarned = false;
+
+  // Bounds how many `recordError` writes this handlers instance lets run
+  // concurrently in the background (see `handleIngest`). Small on purpose:
+  // each one holds a pool connection for a transaction, and the pool itself
+  // only has four.
+  const MAX_INFLIGHT_CAPTURES = 8;
+  let inFlightCaptures = 0;
+
   /**
    * Parses a browser-reported error out of the request body. Everything is
    * taken from the body except `source` (always forced to `"browser"`) and
@@ -257,7 +358,21 @@ export function createHandlers(ops: OpsInstance) {
     const message = stringField(parsed.message);
     if (!message) return null;
 
-    const userId = ops.config.currentUserId ? await ops.config.currentUserId(req) : undefined;
+    let userId: string | undefined;
+    if (ops.config.currentUserId) {
+      try {
+        userId = await ops.config.currentUserId(req);
+      } catch (err) {
+        // Attribution is best-effort and must not fail the capture -- but a
+        // resolver that throws can otherwise die silently and permanently,
+        // with no signal it ever happened.
+        if (!currentUserIdWarned) {
+          currentUserIdWarned = true;
+          console.error("[ops] currentUserId resolver threw; browser-reported errors will be unattributed", err);
+        }
+        userId = undefined;
+      }
+    }
 
     return {
       type: stringField(parsed.type) ?? "Error",
@@ -278,11 +393,21 @@ export function createHandlers(ops: OpsInstance) {
   /**
    * POST /ops/api/ingest -- takes no ops session (errors happen to ordinary
    * and signed-out users, who never have one) and no CSRF token (there is no
-   * session to bind one to). Its only defences are: same-origin, a size cap,
-   * and a per-IP rate limit. Past those three gates this always answers 204,
-   * even when it silently discards a malformed or unstorable report -- a
-   * failing ingest must never surface as an error of its own to a user who is
-   * already looking at a broken page.
+   * session to bind one to). Its defences are: same-origin, a size cap, a
+   * per-IP rate limit, and a process-wide rate ceiling. Past those gates
+   * this always answers 204, even when it silently discards a malformed or
+   * unstorable report -- a failing ingest must never surface as an error of
+   * its own to a user who is already looking at a broken page.
+   *
+   * The write itself happens in the background, after this responds: each
+   * capture takes a pool connection for a transaction, and awaiting that
+   * inline would let a modest flood pin all four connections in the pool,
+   * stalling `/ops` health and the error views themselves -- the diagnostic
+   * tool dying under the exact attack it exists to reveal. In-flight
+   * background writes are bounded by `MAX_INFLIGHT_CAPTURES`; past that, a
+   * capture is dropped outright rather than queued, which is the same
+   * "discard rather than let it become the outage" choice as everything
+   * else this handler does under load.
    */
   async function handleIngest(req: Request): Promise<Response> {
     if (!isSameOriginIngest(req)) return respond(403);
@@ -292,32 +417,45 @@ export function createHandlers(ops: OpsInstance) {
     if (!gate.ok) {
       return respond(429, null, { "Retry-After": String(Math.ceil(gate.retryAfterMs / 1000)) });
     }
-    ingestLimiter.fail(ip); // Every accepted-so-far request counts against the budget, not just failures.
+    const globalGate = globalIngestLimiter.check(GLOBAL_INGEST_KEY);
+    if (!globalGate.ok) {
+      return respond(429, null, { "Retry-After": String(Math.ceil(globalGate.retryAfterMs / 1000)) });
+    }
+    // Every accepted-so-far request counts against both budgets, not just failures.
+    ingestLimiter.fail(ip);
+    globalIngestLimiter.fail(GLOBAL_INGEST_KEY);
 
+    // Cheap early rejection when the client is honest about Content-Length --
+    // but never relied on alone: a chunked request, or one that lies, skips
+    // straight past this and is caught by the streaming read below instead.
     const contentLength = req.headers.get("content-length");
     if (contentLength && Number(contentLength) > MAX_INGEST_BYTES) {
       return respond(413);
     }
 
-    let raw: string;
-    try {
-      raw = await req.text();
-    } catch {
-      return respond(204);
-    }
-    if (Buffer.byteLength(raw, "utf8") > MAX_INGEST_BYTES) {
-      return respond(413);
-    }
+    const body = await readCappedBody(req, MAX_INGEST_BYTES);
+    if (!body.ok) return respond(413);
+    const raw = body.text;
 
-    try {
-      await ops.ready();
-      const event = await browserEventFromBody(raw, req);
-      if (event) await recordError(ops.pool, event);
-    } catch {
-      // Malformed payload, a resolver that threw, or a storage failure --
-      // discard silently. recordError itself never throws either way; this
-      // guards ops.ready() and the resolver call above it.
+    if (inFlightCaptures >= MAX_INFLIGHT_CAPTURES) {
+      return respond(204); // Drop under flood -- see the docstring above.
     }
+    inFlightCaptures++;
+    void (async () => {
+      try {
+        await ops.ready();
+        const event = await browserEventFromBody(raw, req);
+        if (event) await recordError(ops.pool, event);
+      } catch {
+        // Malformed payload, a resolver that threw (already logged once,
+        // above), or a storage failure -- discard silently. recordError
+        // itself never throws either way; this guards ops.ready() and the
+        // parse above it.
+      } finally {
+        inFlightCaptures--;
+      }
+    })();
+
     return respond(204);
   }
 

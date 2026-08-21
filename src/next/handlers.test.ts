@@ -94,6 +94,7 @@ const { POST: POST2 } = createHandlers(ops2);
 // test that exercises it must use its own client IP or it inherits the neighbours' failures.
 function form(
   path: string, fields: Record<string, string>, cookie?: string, ip = "203.0.113.7",
+  extraHeaders: Record<string, string> = {},
 ): Request {
   // Requests carrying the authenticated cookie are, by construction, requests
   // that need a valid CSRF token — auto-inject it so every existing test does
@@ -106,6 +107,7 @@ function form(
       "content-type": "application/x-www-form-urlencoded",
       ...(cookie ? { cookie } : {}),
       "x-forwarded-for": ip,
+      ...extraHeaders,
     },
     body: new URLSearchParams(fields2).toString(),
   });
@@ -131,16 +133,55 @@ function rawForm(path: string, fields: Record<string, string>, cookie?: string, 
  */
 function ingestRequest(opts: {
   body?: Record<string, unknown>; raw?: string; origin?: string; referer?: string; ip?: string;
+  cfConnectingIp?: string; xRealIp?: string;
 } = {}): Request {
   const headers: Record<string, string> = {
     "content-type": "application/json",
     "x-forwarded-for": opts.ip ?? "203.0.113.150",
   };
+  if (opts.cfConnectingIp) headers["cf-connecting-ip"] = opts.cfConnectingIp;
+  if (opts.xRealIp) headers["x-real-ip"] = opts.xRealIp;
   const origin = opts.origin === undefined ? "https://app.test" : opts.origin;
   if (origin) headers.origin = origin;
   if (opts.referer) headers.referer = opts.referer;
   const body = opts.raw ?? JSON.stringify(opts.body ?? { type: "Error", message: "default ingest message" });
   return new Request("https://app.test/ops/api/ingest", { method: "POST", headers, body });
+}
+
+/**
+ * Builds an ingest POST whose body is a `ReadableStream` -- the one shape a
+ * plain string body (which fetch/undici always gives an explicit
+ * Content-Length for) can never produce. `Request` with a stream body has no
+ * Content-Length header at all here, exactly like a real chunked POST with
+ * none sent, which is the case the post-read size check used to miss
+ * entirely. `totalBytes` worth of `x` is emitted across `chunkBytes`-sized
+ * chunks; `onPull` is invoked once per chunk actually pulled out of the
+ * stream, so a test can assert the handler stopped reading early.
+ */
+function streamingIngestRequest(opts: {
+  totalBytes: number; chunkBytes: number; onPull: () => void; ip?: string;
+}): Request {
+  const encoder = new TextEncoder();
+  let sent = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (sent >= opts.totalBytes) {
+        controller.close();
+        return;
+      }
+      opts.onPull();
+      const size = Math.min(opts.chunkBytes, opts.totalBytes - sent);
+      controller.enqueue(encoder.encode("x".repeat(size)));
+      sent += size;
+    },
+  });
+  return new Request("https://app.test/ops/api/ingest", {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: "https://app.test", "x-forwarded-for": opts.ip ?? "203.0.113.170" },
+    body: stream,
+    // Required by the fetch spec whenever the body is a stream.
+    duplex: "half",
+  } as RequestInit);
 }
 
 /** The ingest write is fire-and-forget; poll instead of assuming a fixed delay. */
@@ -548,16 +589,6 @@ test("ingest stores the rest of a well-formed body's fields", async () => {
   assert.equal(ctx.password, "<redacted>");
 });
 
-test("ingest rate limits at 20 requests per minute per IP", async () => {
-  const ip = "203.0.113.161";
-  let last: Response | undefined;
-  for (let i = 0; i < 21; i++) {
-    last = await POST(ingestRequest({ ip, body: { type: "Error", message: `rate limit ingest case ${i}` } }));
-  }
-  assert.equal(last!.status, 429);
-  assert.ok(Number(last!.headers.get("retry-after")) > 0);
-});
-
 test("every ingest response still carries noindex and no-store", async () => {
   const res = await POST(ingestRequest({
     ip: "203.0.113.162",
@@ -565,4 +596,241 @@ test("every ingest response still carries noindex and no-store", async () => {
   }));
   assert.match(res.headers.get("x-robots-tag")!, /noindex/);
   assert.equal(res.headers.get("cache-control"), "no-store");
+});
+
+// --- security review fix pass --------------------------------------------
+//
+// The two streaming-body tests below run BEFORE "ingest rate limits..." on
+// purpose: that test fires 20+ requests back to back, and since the write
+// is now backgrounded (fix 4) rather than awaited inline, its background
+// captures can still be draining through the small in-flight cap for a
+// little while after the test itself returns. A single-request test placed
+// right after it can genuinely get its own capture dropped by that same
+// cap -- correct behaviour under flood, but a false failure for an
+// unrelated single-request assertion. Order, not a larger cap, is the fix.
+
+test("ingest reads the body as a stream and aborts as soon as the cap is passed, with no Content-Length at all", async () => {
+  let pulls = 0;
+  const req = streamingIngestRequest({
+    totalBytes: 100 * 1024, // 100 KB, well over the 16 KB cap
+    chunkBytes: 1024, // 100 chunks
+    onPull: () => { pulls++; },
+    ip: "203.0.113.171",
+  });
+  assert.equal(req.headers.get("content-length"), null, "a stream body must carry no Content-Length here");
+
+  const res = await POST(req);
+  assert.equal(res.status, 413);
+  // The cap (16 KB) is crossed partway through chunk 17 of 100 -- the
+  // handler must abort there, not after pulling the whole 100 KB body.
+  assert.ok(pulls < 100, `expected the handler to stop early; it pulled all ${pulls} chunks`);
+  assert.ok(pulls <= 20, `expected the handler to stop close to the cap, it pulled ${pulls} chunks`);
+});
+
+test("a chunked body under the cap is still accepted and stored, even with no Content-Length", async () => {
+  const message = "chunked-under-cap-case";
+  const payload = JSON.stringify({ type: "Error", message });
+  const encoder = new TextEncoder();
+  const bytes = encoder.encode(payload);
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      // Split into two chunks so it genuinely streams rather than arriving whole.
+      const mid = Math.floor(bytes.length / 2);
+      controller.enqueue(bytes.slice(0, mid));
+      controller.enqueue(bytes.slice(mid));
+      controller.close();
+    },
+  });
+  const req = new Request("https://app.test/ops/api/ingest", {
+    method: "POST",
+    headers: { "content-type": "application/json", origin: "https://app.test", "x-forwarded-for": "203.0.113.172" },
+    body: stream,
+    duplex: "half",
+  } as RequestInit);
+
+  const res = await POST(req);
+  assert.equal(res.status, 204);
+  const id = fingerprint({ type: "Error", message });
+  await waitForGroup(id);
+});
+
+test("ingest rate limits at 20 requests per minute per IP -- the 20th is admitted, the 21st is not", async () => {
+  // A bare "the 21st is refused" assertion would pass just as well with the
+  // limit set to 5 -- assert the 20th succeeds too, so this actually pins
+  // the limit at 20 rather than merely "some number at or below 21".
+  //
+  // Each message ends in a distinct *letter*, not a digit -- normalizeMessage
+  // collapses digits to a placeholder, so 21 digit-suffixed messages would
+  // all fingerprint identically and serialise on one group row's lock. Since
+  // the write is now backgrounded (fix 4), that serialisation can easily
+  // outlast this test itself and bleed into whatever runs next.
+  const ip = "203.0.113.161";
+  const responses: Response[] = [];
+  for (let i = 0; i < 21; i++) {
+    const letter = String.fromCharCode(97 + i);
+    responses.push(await POST(ingestRequest({ ip, body: { type: "Error", message: `rate limit ingest case ${letter}` } })));
+  }
+  assert.equal(responses[19]!.status, 204, "the 20th request must still be admitted");
+  assert.equal(responses[20]!.status, 429, "the 21st request must be refused");
+  assert.ok(Number(responses[20]!.headers.get("retry-after")) > 0);
+});
+
+test("clientIp prefers cf-connecting-ip, so two real users behind one shared Cloudflare edge get independent ingest rate-limit buckets", async () => {
+  const sharedEdge = "198.51.100.1";
+  const userA = "203.0.113.201";
+  const userB = "203.0.113.202";
+
+  let last: Response | undefined;
+  for (let i = 0; i < 21; i++) {
+    last = await POST(ingestRequest({
+      ip: sharedEdge, cfConnectingIp: userA,
+      body: { type: "Error", message: `shared-edge-user-a-${i}` },
+    }));
+  }
+  assert.equal(last!.status, 429, "user A's own budget must be exhaustible");
+
+  // User B, identified by a different cf-connecting-ip behind the SAME
+  // x-forwarded-for edge address, must not inherit user A's exhausted budget
+  // -- that's exactly the collision the old last-XFF-hop logic caused.
+  const stillOk = await POST(ingestRequest({
+    ip: sharedEdge, cfConnectingIp: userB,
+    body: { type: "Error", message: "shared-edge-user-b-unaffected" },
+  }));
+  assert.equal(stillOk.status, 204);
+});
+
+test("clientIp falls back to x-real-ip when cf-connecting-ip is absent", async () => {
+  const sharedEdge = "198.51.100.2";
+  const userA = "203.0.113.203";
+  const userB = "203.0.113.204";
+
+  let last: Response | undefined;
+  for (let i = 0; i < 21; i++) {
+    last = await POST(ingestRequest({
+      ip: sharedEdge, xRealIp: userA,
+      body: { type: "Error", message: `x-real-ip-user-a-${i}` },
+    }));
+  }
+  assert.equal(last!.status, 429);
+
+  const stillOk = await POST(ingestRequest({
+    ip: sharedEdge, xRealIp: userB,
+    body: { type: "Error", message: "x-real-ip-user-b-unaffected" },
+  }));
+  assert.equal(stillOk.status, 204);
+});
+
+test("the login limiter uses the same cf-connecting-ip-aware IP resolution as ingest, so a shared edge no longer pools every visitor into one lockout bucket", async () => {
+  const sharedEdge = "198.51.100.3";
+  const attacker = "203.0.113.205";
+  const genuineUser = "203.0.113.206";
+
+  for (let i = 0; i < 5; i++) {
+    const res = await POST(form(
+      "login", { email: "me@lnrt.cz", password: "nope" }, undefined, sharedEdge,
+      { "cf-connecting-ip": attacker },
+    ));
+    assert.equal(res.status, 303);
+  }
+  const blocked = await POST(form(
+    "login", { email: "me@lnrt.cz", password: "correct horse battery" }, undefined, sharedEdge,
+    { "cf-connecting-ip": attacker },
+  ));
+  assert.equal(blocked.status, 429, "the attacker's own five failures must lock them out");
+
+  // A different real visitor behind the same edge, identified by their own
+  // cf-connecting-ip, must not inherit that lockout.
+  const unaffected = await POST(form(
+    "login", { email: "me@lnrt.cz", password: "correct horse battery" }, undefined, sharedEdge,
+    { "cf-connecting-ip": genuineUser },
+  ));
+  assert.equal(unaffected.status, 303, "an unrelated visitor behind the same edge must still be able to sign in");
+});
+
+test("a throwing currentUserId resolver is logged once and does not stop the event from being stored unattributed", async () => {
+  let calls = 0;
+  const throwingOps = defineOps({
+    db: { connectionString: DB_URL }, users: store,
+    currentUserId: () => { calls++; throw new Error("resolver blew up"); },
+  });
+  const { POST: POSTThrowing } = createHandlers(throwingOps);
+
+  const originalError = console.error;
+  let loggedCount = 0;
+  console.error = (...args: unknown[]) => {
+    if (String(args[0] ?? "").includes("currentUserId")) loggedCount++;
+  };
+  try {
+    const res1 = await POSTThrowing(ingestRequest({
+      ip: "203.0.113.180", body: { type: "Error", message: "throwing resolver case one" },
+    }));
+    const res2 = await POSTThrowing(ingestRequest({
+      ip: "203.0.113.181", body: { type: "Error", message: "throwing resolver case two" },
+    }));
+    assert.equal(res1.status, 204);
+    assert.equal(res2.status, 204);
+
+    const id1 = fingerprint({ type: "Error", message: "throwing resolver case one" });
+    const group1 = await waitForGroup(id1);
+    const events1 = await listErrorEvents(ops.pool, group1.id, 1);
+    assert.equal(events1[0]!.userId, undefined, "attribution must be dropped, not fabricated, when the resolver throws");
+
+    const id2 = fingerprint({ type: "Error", message: "throwing resolver case two" });
+    await waitForGroup(id2);
+  } finally {
+    console.error = originalError;
+  }
+  assert.equal(calls, 2, "the resolver must have actually been called (and thrown) both times");
+  assert.equal(loggedCount, 1, "a throwing resolver must be logged once, not on every call and not silently");
+});
+
+test("POST /ops/api/ingest 404s like every other route when the gate is unconfigured", async () => {
+  const saved = process.env.OPS_PASSWORD_HASH;
+  delete process.env.OPS_PASSWORD_HASH;
+  try {
+    const res = await POST(ingestRequest({
+      ip: "203.0.113.182", body: { type: "Error", message: "ingest while disabled case" },
+    }));
+    assert.equal(res.status, 404);
+  } finally {
+    process.env.OPS_PASSWORD_HASH = saved;
+  }
+});
+
+test("a forged but matching Origin header from a plain non-browser client (curl) still passes the same-origin check -- it is not a CSRF defence", async () => {
+  // Documents the limit called out in the same-origin comment: unlike a real
+  // browser, curl can set any Origin it likes. This proves the check only
+  // ever stops a drive-by cross-site *browser* POST, nothing else.
+  const res = await POST(ingestRequest({
+    ip: "203.0.113.183",
+    origin: "https://app.test", // no browser involved in building this request at all
+    body: { type: "Error", message: "curl with a forged matching origin" },
+  }));
+  assert.equal(res.status, 204);
+  const id = fingerprint({ type: "Error", message: "curl with a forged matching origin" });
+  await waitForGroup(id);
+});
+
+// This test must run LAST in the file: it deliberately exhausts the
+// process-wide ingest ceiling, which then stays blocked (blockMs) for far
+// longer than the rest of this suite takes to run -- any ingest test placed
+// after it would see spurious 429s that have nothing to do with what it's
+// actually testing.
+test("a process-wide ingest ceiling refuses further requests once ~600/minute is reached, even across many distinct client IPs", async () => {
+  // Each request uses its own IP so the per-IP 20/min limiter never fires --
+  // only the global ceiling can be responsible for a 429 here. Because the
+  // ceiling's state is shared with every earlier ingest test in this file
+  // (all within the same minute by wall-clock construction), this test does
+  // not assume its own request count lines up exactly with the threshold --
+  // only that comfortably more requests than the ceiling allows eventually
+  // produces a 429, and that not every request in the run was refused.
+  const responses: Response[] = [];
+  for (let i = 0; i < 650; i++) {
+    responses.push(await POST(ingestRequest({
+      ip: `unique-client-${i}`, // a distinct rate-limit key per request; clientIp never validates IP shape
+      body: { type: "Error", message: `global-ceiling-case-${i}` },
+    })));
+  }
+  assert.ok(responses.some((r) => r.status === 204), "at least some requests must have been admitted");
+  assert.equal(responses.at(-1)!.status, 429, "well past 600 requests, the global ceiling must have engaged");
 });

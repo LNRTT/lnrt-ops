@@ -101,3 +101,54 @@ test("the body never includes a userId field -- the endpoint must not trust one 
   const body = JSON.parse(calls[0]!.init.body!) as Record<string, unknown>;
   assert.equal("userId" in body, false);
 });
+
+// --- security review fix pass ---------------------------------------------
+// A component that throws on every render (or a tight retry loop hitting a
+// broken endpoint) can fire the error handler thousands of times a minute
+// with no throttle of its own -- and a 429 from the server doesn't slow it
+// down, since the script never looks at the response. Fix 5 caps total
+// reports per page load and dedups repeats of the exact same signature.
+
+test("at most 10 reports are sent per page load; further distinct errors are dropped", () => {
+  const { listeners, calls } = run();
+  for (let i = 0; i < 15; i++) {
+    listeners.error!({ error: new Error(`distinct error #${i}`) });
+  }
+  assert.equal(calls.length, 10);
+});
+
+test("a report whose message and stack match one already sent from this page is suppressed, even well under the 10-report cap", () => {
+  const { listeners, calls } = run();
+  const err = new Error("repeated error");
+  for (let i = 0; i < 5; i++) {
+    listeners.error!({ error: err });
+  }
+  assert.equal(calls.length, 1, "an identical message+stack must only be sent once per page load");
+});
+
+test("dedup is keyed on message AND stack together -- same message, different stack, both get sent", () => {
+  const { listeners, calls } = run();
+  const errA = new Error("same message, different origin");
+  errA.stack = "Error: same message, different origin\n    at a (/app/a.js:1:1)";
+  const errB = new Error("same message, different origin");
+  errB.stack = "Error: same message, different origin\n    at b (/app/b.js:1:1)";
+  listeners.error!({ error: errA });
+  listeners.error!({ error: errB });
+  assert.equal(calls.length, 2);
+});
+
+test("a dedup-suppressed repeat does not itself count against the 10-report budget", () => {
+  const { listeners, calls } = run();
+  const err = new Error("repeated, budget-neutral error");
+  for (let i = 0; i < 20; i++) {
+    listeners.error!({ error: err });
+  }
+  // All 20 are the same signature -- exactly one send, with 9 of the budget
+  // untouched -- proved by then sending 9 distinct new errors and getting
+  // all 9 through.
+  assert.equal(calls.length, 1);
+  for (let i = 0; i < 9; i++) {
+    listeners.error!({ error: new Error(`fresh distinct error #${i}`) });
+  }
+  assert.equal(calls.length, 10);
+});

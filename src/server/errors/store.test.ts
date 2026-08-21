@@ -1,4 +1,4 @@
-import { test, before, after } from "node:test";
+import { test, before, after, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { Pool } from "pg";
 import { migrate } from "../migrate";
@@ -12,6 +12,7 @@ import {
   listErrorEvents,
   setErrorGroupStatus,
   pruneErrors,
+  SUPPRESSED_GROUP_ID,
   type CapturedError,
 } from "./store";
 
@@ -23,6 +24,16 @@ before(async () => {
 });
 after(async () => {
   await pool.end();
+});
+// The new-group budget in recordError() counts every group in the store
+// with a recent first_seen, globally -- not scoped to one test. Without a
+// clean slate, an earlier test's groups (all "within the last hour" by
+// wall-clock construction) eat into a later test's budget and silently
+// reroute its fingerprint into the synthetic suppression group instead of
+// giving it its own, which then makes an unrelated assertion pass or fail
+// for the wrong reason.
+beforeEach(async () => {
+  await pool.query("TRUNCATE ops_error_event, ops_error_group");
 });
 
 // `label` drives both the message and the stack frame's filename, so each
@@ -333,4 +344,136 @@ test("source stays at its first-seen value even when a later capture reports a d
   const id = fingerprint(err);
   const group = await getErrorGroup(pool, id);
   assert.equal(group!.source, "server");
+});
+
+// --- security review fix pass -------------------------------------------
+
+test("an oversized type is stored truncated, with the NUL stripped", async () => {
+  const err = makeError("victor", {
+    type: "T".repeat(500) + String.fromCharCode(0) + "extra",
+  });
+  await recordError(pool, err);
+  const id = fingerprint(err);
+  const group = await getErrorGroup(pool, id);
+  assert.ok(group);
+  assert.equal(group!.type.length, 200);
+  assert.equal(group!.type.includes(String.fromCharCode(0)), false);
+});
+
+test("an oversized culprit (from a very long stack frame path) is stored truncated", async () => {
+  const longPath = "a".repeat(1000);
+  const err = makeError("whiskey", {
+    stack: `TypeError: boom\n    at save (/app/src/lib/${longPath}.ts:44:9)`,
+  });
+  await recordError(pool, err);
+  const id = fingerprint(err);
+  const group = await getErrorGroup(pool, id);
+  assert.ok(group);
+  assert.ok(group!.culprit.length <= 500, `expected culprit <= 500 chars, got ${group!.culprit.length}`);
+});
+
+test("a javascript: URL is rejected and stored as absent, not written into the row", async () => {
+  const err = makeError("xray", { url: "javascript:alert(document.cookie)" });
+  await recordError(pool, err);
+  const id = fingerprint(err);
+  const events = await listErrorEvents(pool, id);
+  assert.equal(events[0]!.url, undefined);
+});
+
+test("an http(s) URL is still stored normally", async () => {
+  const err = makeError("yankee", { url: "https://app.test/some/page?x=1" });
+  await recordError(pool, err);
+  const id = fingerprint(err);
+  const events = await listErrorEvents(pool, id);
+  assert.equal(events[0]!.url, "https://app.test/some/page");
+});
+
+test("a relative URL with no scheme is still stored, just with its query stripped", async () => {
+  const err = makeError("zulu", { url: "/dashboard?secret=1" });
+  await recordError(pool, err);
+  const id = fingerprint(err);
+  const events = await listErrorEvents(pool, id);
+  assert.equal(events[0]!.url, "/dashboard");
+});
+
+test("context.filename keeps its query string stripped, same as the top-level url", async () => {
+  const err = makeError("alpha-two", { context: { filename: "https://app.test/app.js?v=abc123#frag" } });
+  await recordError(pool, err);
+  const id = fingerprint(err);
+  const events = await listErrorEvents(pool, id);
+  const ctx = events[0]!.context as Record<string, unknown>;
+  assert.equal(ctx.filename, "https://app.test/app.js");
+});
+
+test("60 distinct new fingerprints in one hour produce 50 real groups plus one synthetic suppression group", async () => {
+  const groupIds: string[] = [];
+  for (let i = 0; i < 60; i++) {
+    const err = makeError(`bravo-two-budget-${i}`);
+    await recordError(pool, err);
+    groupIds.push(fingerprint(err));
+  }
+
+  let realGroups = 0;
+  for (const id of groupIds) {
+    const group = await getErrorGroup(pool, id);
+    if (group) realGroups++;
+  }
+  assert.equal(realGroups, 50, "only the first 50 previously-unseen fingerprints should get their own group");
+
+  const suppressed = await getErrorGroup(pool, SUPPRESSED_GROUP_ID);
+  assert.ok(suppressed, "the remaining 10 fingerprints must be recorded against the synthetic suppression group");
+  assert.equal(suppressed!.eventCount, 10);
+  assert.match(suppressed!.message, /suppress/i);
+});
+
+test("once an existing group is over budget, a repeat of the SAME fingerprint still updates its own group, not the synthetic one", async () => {
+  // Burn the whole new-group budget on fresh fingerprints first.
+  let last: CapturedError | undefined;
+  for (let i = 0; i < 50; i++) {
+    const err = makeError(`charlie-two-budget-${i}`);
+    await recordError(pool, err);
+    last = err;
+  }
+  // A brand new 51st fingerprint should be suppressed...
+  const newErr = makeError("charlie-two-budget-new");
+  await recordError(pool, newErr);
+  const newId = fingerprint(newErr);
+  assert.equal(await getErrorGroup(pool, newId), null);
+
+  // ...but repeating one of the 50 already-admitted fingerprints must still
+  // land on its own existing group, not get swept into the synthetic one.
+  await recordError(pool, last!);
+  const lastId = fingerprint(last!);
+  const group = await getErrorGroup(pool, lastId);
+  assert.ok(group);
+  assert.equal(group!.eventCount, 2);
+});
+
+test("pruneErrors removes a group that has no remaining events and has not been seen within the window", async () => {
+  const err = makeError("delta-two-stale");
+  await recordError(pool, err);
+  const id = fingerprint(err);
+
+  // Age both the event (so the event-prune deletes it) and the group's own
+  // last_seen (so it counts as stale, not merely empty).
+  await pool.query(`UPDATE ops_error_event SET at = now() - interval '40 days' WHERE group_id = $1`, [id]);
+  await pool.query(`UPDATE ops_error_group SET last_seen = now() - interval '40 days' WHERE id = $1`, [id]);
+
+  await pruneErrors(pool, 30);
+
+  assert.equal(await getErrorGroup(pool, id), null, "a stale, now-empty group must be removed");
+});
+
+test("pruneErrors keeps a group with no remaining events if it was seen recently", async () => {
+  const err = makeError("echo-two-fresh-empty");
+  await recordError(pool, err);
+  const id = fingerprint(err);
+
+  // Age only the event, not the group's last_seen.
+  await pool.query(`UPDATE ops_error_event SET at = now() - interval '40 days' WHERE group_id = $1`, [id]);
+
+  await pruneErrors(pool, 30);
+
+  const group = await getErrorGroup(pool, id);
+  assert.ok(group, "a group seen recently must survive even once its events have all aged out");
 });

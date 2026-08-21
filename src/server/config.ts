@@ -25,6 +25,14 @@ export type OpsConfig = {
    * never trusts a body-supplied `userId`; this resolver is the only source it
    * will accept one from. Omit it, or return `undefined`, to leave browser-
    * reported events unattributed.
+   *
+   * It runs on every well-formed body reaching `/ops/api/ingest` — including
+   * anonymous, signed-out traffic — so it **must be cheap** (no slow query;
+   * this is not the place for a database round trip on the hot path of an
+   * error report) **and must not throw**. If it does throw, the capture still
+   * proceeds unattributed rather than being dropped, but the throw is logged
+   * once (not on every call) so a broken resolver doesn't fail silently and
+   * permanently.
    */
   currentUserId?: (req: Request) => Promise<string | undefined> | string | undefined;
 };

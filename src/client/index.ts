@@ -25,8 +25,31 @@ export function browserErrorScript(): string {
   return `(function () {
   if (typeof window === "undefined" || typeof fetch === "undefined") return;
 
+  // A component that throws on every render (or a tight retry loop hitting a
+  // broken endpoint) can otherwise fire this thousands of times a minute --
+  // and a 429 from the server doesn't slow it down, since nothing here reads
+  // the response. Two independent guards, reset only on a fresh page load:
+  //  - MAX_REPORTS bounds the total this page will ever send.
+  //  - "seen" drops a repeat of the exact same message+stack outright, before
+  //    it can even count against that budget -- the common case (one broken
+  //    component throwing over and over) should cost the endpoint one write,
+  //    not ten identical ones.
+  var MAX_REPORTS = 10;
+  var sentCount = 0;
+  // Object.create(null) -- a plain {} would let a message/stack that happens
+  // to read "constructor" or "__proto__" match an inherited Object.prototype
+  // property instead of an actual prior report, causing a false-positive
+  // suppression before anything was ever really sent.
+  var seen = Object.create(null);
+
   function post(type, message, stack, extra) {
     try {
+      var key = String(message) + "\\u0000" + String(stack || "");
+      if (seen[key]) return;
+      seen[key] = true;
+      if (sentCount >= MAX_REPORTS) return;
+      sentCount++;
+
       var payload = JSON.stringify({
         type: type,
         message: message,
