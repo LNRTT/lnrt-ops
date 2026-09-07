@@ -46,10 +46,11 @@ for name, service in compose['services'].items():
     service.pop('container_name', None)
     service.pop('ports', None)
     service['logging'] = {'driver': 'json-file', 'options': {'max-size': '10m', 'max-file': '3'}}
+    service.update(cpus=2, cgroup_parent='lnrt-openreplay.slice')
     if 'migration' in service.get('profiles', []):
         service['mem_limit'] = '512m'
     else:
-        service.update(restart='unless-stopped', cpus=2, cgroup_parent='lnrt-openreplay.slice')
+        service['restart'] = 'unless-stopped'
         service['mem_limit'] = {'clickhouse': '2g', 'postgresql': '768m', 'minio': '768m',
                                 'chalice-openreplay': '1g'}.get(name, '384m')
 compose['services']['minio']['environment']['RUSTFS_CONSOLE_ENABLE'] = 'false'
