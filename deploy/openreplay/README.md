@@ -69,12 +69,16 @@ No plaintext OPS password is needed or logged during provisioning.
 ## Host application and verification
 
 Docházka uses `@lnrt/ops` 0.3.0 and tracker 18.1.5, with runtime configuration in
-Coolify. Its repository contains the masked worker-only recording lifecycle,
-24 real-SDK regression checks and an actual browser → ingest → OPS test.
+Coolify. Its repository records authenticated business screens in administration
+and the worker area, with readable names, addresses, text and ordinary inputs
+as explicitly requested by the owner. Login, invitations, OPS and credential
+management stay excluded; network and console capture stay off. It contains
+32 real-SDK regression checks and worker/admin browser → ingest → OPS tests.
 
 The SDK has a pinned postinstall patch in the application: privateMode alone in
 18.1.5 misses initial referrer/worker URL redaction, and stop() alone does not cancel
-in-flight startup before the next page is captured. The patch addresses both.
+in-flight startup before the next page is captured. The patch addresses both
+and applies the application URL policy to navigation referrers in readable mode.
 Review that proof before adding another application; the library privacy preset
 alone does not solve those upstream SDK bugs.
 
