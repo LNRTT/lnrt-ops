@@ -1,3 +1,4 @@
+import { openReplayUrl } from "../../shared/openreplay";
 import type { ErrorEventRow, ErrorGroupRow } from "../../server/errors/store";
 
 const STATUS_TAG: Record<ErrorGroupRow["status"], string> = { open: "warn", resolved: "good", ignored: "neutral" };
@@ -24,8 +25,8 @@ function StatusForm({ id, status, csrf, label }: { id: string; status: "resolved
 }
 
 export function ErrorDetail({
-  group, events, csrf,
-}: { group: ErrorGroupRow; events: ErrorEventRow[]; csrf: string }) {
+  group, events, csrf, replayProjectUrl,
+}: { group: ErrorGroupRow; events: ErrorEventRow[]; csrf: string; replayProjectUrl?: string }) {
   return (
     <>
       <div className="ops-card">
@@ -53,28 +54,32 @@ export function ErrorDetail({
       {events.length === 0 ? (
         <div className="ops-card"><p className="ops-note">No stored events for this group.</p></div>
       ) : (
-        events.map((e) => (
-          <div className="ops-card" key={e.id}>
-            <p className="ops-note">
-              {fmt(e.at)} · {e.source}
-              {e.method ? ` · ${e.method}` : ""}
-              {e.url ? ` · ${e.url}` : ""}
-              {e.release ? ` · release ${e.release}` : ""}
-            </p>
-            {(e.userId || e.userAgent) && (
+        events.map((e) => {
+          const replay = replayProjectUrl ? openReplayUrl(e.context?.openReplayUrl, replayProjectUrl) : undefined;
+          return (
+            <div className="ops-card" key={e.id}>
               <p className="ops-note">
-                {e.userId ? `User ${e.userId}${e.userRole ? ` (${e.userRole})` : ""}` : null}
-                {e.userId && e.userAgent ? " · " : null}
-                {e.userAgent ?? null}
+                {fmt(e.at)} · {e.source}
+                {e.method ? ` · ${e.method}` : ""}
+                {e.url ? ` · ${e.url}` : ""}
+                {e.release ? ` · release ${e.release}` : ""}
               </p>
-            )}
-            <p>{e.message}</p>
-            {/* message/stack/url/culprit are attacker-controlled -- rendered as plain text
-                children only, never as a URL or via dangerouslySetInnerHTML. */}
-            {e.stack && <pre className="ops-pre">{e.stack}</pre>}
-            {e.context && <pre className="ops-pre">{JSON.stringify(e.context, null, 2)}</pre>}
-          </div>
-        ))
+              {(e.userId || e.userAgent) && (
+                <p className="ops-note">
+                  {e.userId ? `User ${e.userId}${e.userRole ? ` (${e.userRole})` : ""}` : null}
+                  {e.userId && e.userAgent ? " · " : null}
+                  {e.userAgent ?? null}
+                </p>
+              )}
+              <p>{e.message}</p>
+              {/* message/stack/url/culprit are attacker-controlled -- rendered as plain text
+                  children only, never as a URL or via dangerouslySetInnerHTML. */}
+              {replay && <p><a className="ops-btn" href={replay} target="_blank" rel="noopener noreferrer">Přehrát průběh ↗</a></p>}
+              {e.stack && <pre className="ops-pre">{e.stack}</pre>}
+              {e.context && <pre className="ops-pre">{JSON.stringify(e.context, null, 2)}</pre>}
+            </div>
+          );
+        })
       )}
     </>
   );

@@ -1,3 +1,4 @@
+import { openReplayUrl } from "../shared/openreplay";
 import { createHmac, timingSafeEqual } from "node:crypto";
 import { writeAudit } from "../server/audit";
 import type { OpsInstance } from "../server/config";
@@ -400,6 +401,12 @@ export function createHandlers(ops: OpsInstance) {
       }
     }
 
+    const context = isPlainObject(parsed.context) ? { ...parsed.context } : undefined;
+    if (context) {
+      const url = ops.config.openReplay ? openReplayUrl(context.openReplayUrl, ops.config.openReplay.projectUrl) : undefined;
+      delete context.openReplayUrl;
+      if (url) context.openReplayUrl = url;
+    }
     return {
       type: stringField(parsed.type) ?? "Error",
       message,
@@ -412,7 +419,7 @@ export function createHandlers(ops: OpsInstance) {
       requestId: stringField(parsed.requestId),
       release: stringField(parsed.release),
       userAgent: stringField(parsed.userAgent) ?? req.headers.get("user-agent") ?? undefined,
-      context: isPlainObject(parsed.context) ? parsed.context : undefined,
+      context,
     };
   }
 
