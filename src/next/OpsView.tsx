@@ -147,7 +147,7 @@ export async function OpsView({ ops, path, search, cookieHeader }: OpsViewProps)
       const group = await getErrorGroup(ops.pool, path[1]);
       if (!group) return <Shell csrf={csrf}><div className="ops-card">No such error group.</div></Shell>;
       const events = await listErrorEvents(ops.pool, path[1], 50);
-      return <Shell csrf={csrf}><ErrorDetail group={group} events={events} csrf={csrf} /></Shell>;
+      return <Shell csrf={csrf}><ErrorDetail group={group} events={events} csrf={csrf} replayProjectUrl={ops.config.openReplay?.projectUrl} /></Shell>;
     }
 
     const unresolved = one(search.unresolved) === "1";

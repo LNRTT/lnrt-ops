@@ -9,6 +9,8 @@ import type { OpsUserStore } from "./users";
 
 export type OpsConfig = {
   db: { connectionString: string };
+  /** Optional dashboard project URL, e.g. https://replay.example.com/42. */
+  openReplay?: { projectUrl: string };
   users: OpsUserStore;
   /** Mints a one-time sign-in token; the link becomes `${path}/${token}`. */
   loginLink?: { mint(userId: string): Promise<string>; path: string };

@@ -1,3 +1,5 @@
+import { openReplayUrl } from "../../shared/openreplay";
+
 const SENSITIVE = /(pass|pwd|secret|token|credential|apikey|privatekey|signingkey|auth|cookie|session|bearer|key)/;
 const MAX_DEPTH = 6;
 const MAX_STRING = 2000;
@@ -32,7 +34,7 @@ export function redactContext(ctx: Record<string, unknown>): Record<string, unkn
       if (Array.isArray(value)) return value.slice(0, 50).map((v) => walk(v, depth + 1));
       const out: Record<string, unknown> = {};
       for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
-        out[k] = isSensitive(k) ? "<redacted>" : walk(v, depth + 1);
+        out[k] = k === "openReplayUrl" ? openReplayUrl(v) : isSensitive(k) ? "<redacted>" : walk(v, depth + 1);
       }
       return out;
     } finally {

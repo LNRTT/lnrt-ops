@@ -6,7 +6,7 @@ self-applying Postgres schema.
 
 ## Status
 
-v0.1.0. This package ships two entry points:
+v0.3.0. This package ships three entry points:
 
 - `@lnrt/ops/server` — `defineOps()`, the Postgres pool/migrator, the access gate,
   the audit log, health checks, and the `OpsUserStore` contract plus its Prisma
@@ -14,16 +14,28 @@ v0.1.0. This package ships two entry points:
 - `@lnrt/ops/next` — `OpsPage` (the catch-all page component), `OpsView` (the pure,
   Next.js-free renderer it delegates to), and `createHandlers()` (the `/ops/api/*`
   route handlers for `GET`/`POST`).
+- `@lnrt/ops/client` — the inline browser-error reporter and optional OpenReplay
+  bridge, error context helper and privacy starting options.
 
 Together they cover: sign-in gated by an allowlist of emails and a single bcrypt
 password, a user list and detail view (password reset, role change, disable/restore,
 optional hard delete, optional one-time sign-in links), an audit log, and a health
 page (database reachability, required environment variables, build info, pending
 migrations, plus any project-specific checks). All mutations are plain
-`<form method="post">` posts — there is no client-side JavaScript in v0.1.
+`<form method="post">` posts. The Errors view groups server/browser exceptions
+and can link individual occurrences to their OpenReplay recordings.
 
 Deferred to a later version, deliberately: impersonation, session listing/revocation,
-a dedicated error view, an activity feed, and runtime settings.
+an activity feed and runtime settings.
+
+## Optional OpenReplay integration
+
+Configure one OpenReplay project per host application to show **Přehrát průběh**
+on recorded error occurrences. The integration is off by default and uses the
+existing error context without a schema migration. OpenReplay itself remains a
+separate service; hosts opt into its SDK and recording lifecycle.
+
+See [the setup, privacy defaults and rollout guide](docs/openreplay.md).
 
 ## Integration
 
@@ -173,7 +185,7 @@ only the host's error-reporting integration is in a position to scrub it.
 ## Installing in a host project
 
 ```bash
-npm i github:LNRTT/lnrt-ops#v0.1.0
+npm i github:LNRTT/lnrt-ops#v0.3.0
 ```
 
 npm runs the package's `prepare` script (`npm run build`) right after cloning the

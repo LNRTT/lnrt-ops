@@ -1,11 +1,11 @@
 /**
- * `@lnrt/ops/client` — the one thing a host inlines into its pages to report
- * browser errors, and nothing else. Intentionally self-contained (no imports
- * from the rest of the package, or from anywhere): `browserErrorScript()`
+ * `@lnrt/ops/client` — browser error reporting and optional OpenReplay helpers.
+ * The inline reporter is intentionally self-contained: `browserErrorScript()`
  * returns raw JS *text* that a host embeds in a `<script>` tag (e.g.
  * `dangerouslySetInnerHTML`), so this file's own dependency graph must never
- * leak into that text. A shared import here (pulling in `pg` via the server
- * tree, for instance) would either bloat or break whatever actually runs
+ * leak into that text. The replay exports only use browser-safe utilities;
+ * never import server modules here. A shared import pulling in `pg` via the server
+ * tree would either bloat or break whatever actually runs
  * that inlined script in the browser -- mirroring why a host's own
  * `instrumentation-client.ts` keeps itself dependency-free.
  */
@@ -50,13 +50,19 @@ export function browserErrorScript(): string {
       if (sentCount >= MAX_REPORTS) return;
       sentCount++;
 
+      // Resolve at error time: a tracker may start, rotate or stop after this script loads.
+      var context = Object.assign({}, extra);
+      try {
+        var replayUrl = typeof window.__lnrtOpsReplay === "function" ? window.__lnrtOpsReplay() : undefined;
+        if (typeof replayUrl === "string") context.openReplayUrl = replayUrl;
+      } catch (e) { /* Replay failure must not swallow the original error. */ }
       var payload = JSON.stringify({
         type: type,
         message: message,
         stack: stack,
         url: window.location ? window.location.href : undefined,
         userAgent: (typeof navigator !== "undefined" && navigator.userAgent) || undefined,
-        context: extra
+        context: context
       });
       fetch("/ops/api/ingest", {
         method: "POST",
@@ -92,3 +98,5 @@ export function browserErrorScript(): string {
   });
 })();`;
 }
+
+export { connectOpenReplay, getOpenReplayContext, openReplayPrivacyOptions, type OpenReplayTracker } from "./openreplay";
