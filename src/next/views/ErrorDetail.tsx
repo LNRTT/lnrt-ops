@@ -29,8 +29,9 @@ export function ErrorDetail({
 }: { group: ErrorGroupRow; events: ErrorEventRow[]; csrf: string; replayProjectUrl?: string }) {
   return (
     <>
+      <p className="ops-back"><a href="/ops/errors">← Back to errors</a></p>
       <div className="ops-card">
-        <h2>{group.type}: {group.message}</h2>
+        <h1>{group.type}: {group.message}</h1>
         <p className="ops-note">
           {group.culprit || "—"} · {group.source} ·{" "}
           <span className={`ops-tag ${STATUS_TAG[group.status]}`}>{group.status}</span>

@@ -64,7 +64,7 @@ function maybePruneErrors(ops: OpsInstance): void {
   });
 }
 
-function Shell({ csrf, children }: { csrf: string; children: ReactNode }) {
+function Shell({ csrf, section, children }: { csrf: string; section: string; children: ReactNode }) {
   return (
     <div className="ops-root">
       {/* The API sets X-Robots-Tag, but this page is rendered by the host's
@@ -73,18 +73,20 @@ function Shell({ csrf, children }: { csrf: string; children: ReactNode }) {
       <meta name="robots" content="noindex, nofollow" />
       <style>{OPS_STYLES}</style>
       <div className="ops-shell">
-        <nav className="ops-nav">
-          <a href="/ops/users">Users</a>
-          <a href="/ops/errors">Errors</a>
-          <a href="/ops/audit">Audit</a>
-          <a href="/ops/health">Health</a>
-          <span className="ops-spacer" />
+        <header className="ops-topbar">
+          <a className="ops-brand" href="/ops/users">Operations</a>
           <form method="post" action="/ops/api/logout">
             <input type="hidden" name="csrf" value={csrf} />
             <button type="submit">Sign out</button>
           </form>
+        </header>
+        <nav className="ops-nav" aria-label="Operations">
+          <a href="/ops/users" aria-current={section === "users" ? "page" : undefined}>Users</a>
+          <a href="/ops/errors" aria-current={section === "errors" ? "page" : undefined}>Errors</a>
+          <a href="/ops/audit" aria-current={section === "audit" ? "page" : undefined}>Audit</a>
+          <a href="/ops/health" aria-current={section === "health" ? "page" : undefined}>Health</a>
         </nav>
-        {children}
+        <main>{children}</main>
       </div>
     </div>
   );
@@ -109,6 +111,7 @@ export async function OpsView({ ops, path, search, cookieHeader }: OpsViewProps)
   }
 
   const csrf = csrfToken(s.email, process.env.OPS_SECRET ?? "");
+  const section = ["errors", "audit", "health"].includes(path[0] ?? "") ? path[0]! : "users";
 
   // Routed before `ops.ready()`: `ready()` runs migrations and rejects when
   // Postgres is unreachable, and the health page is the one view whose entire
@@ -116,14 +119,14 @@ export async function OpsView({ ops, path, search, cookieHeader }: OpsViewProps)
   // failure, and `checkMigrations` reads the ledger itself (no migration run
   // required), so health needs nothing from `ready()`.
   if (path[0] === "health") {
-    return <Shell csrf={csrf}><Health results={await runChecks(ops.checks(), { pool: ops.pool })} /></Shell>;
+    return <Shell csrf={csrf} section={section}><Health results={await runChecks(ops.checks(), { pool: ops.pool })} /></Shell>;
   }
 
   try {
     await ops.ready();
   } catch {
     return (
-      <Shell csrf={csrf}>
+      <Shell csrf={csrf} section={section}>
         <div className="ops-card">
           <p className="ops-error">The operations database is unavailable.</p>
           <p className="ops-note"><a href="/ops/health">Check the health page</a> for details.</p>
@@ -135,7 +138,7 @@ export async function OpsView({ ops, path, search, cookieHeader }: OpsViewProps)
   const store = ops.config.users;
 
   if (path[0] === "audit") {
-    return <Shell csrf={csrf}><Audit rows={await listAudit(ops.pool, { limit: 200 })} /></Shell>;
+    return <Shell csrf={csrf} section={section}><Audit rows={await listAudit(ops.pool, { limit: 200 })} /></Shell>;
   }
 
   if (path[0] === "errors") {
@@ -145,9 +148,9 @@ export async function OpsView({ ops, path, search, cookieHeader }: OpsViewProps)
 
     if (path[1]) {
       const group = await getErrorGroup(ops.pool, path[1]);
-      if (!group) return <Shell csrf={csrf}><div className="ops-card">No such error group.</div></Shell>;
+      if (!group) return <Shell csrf={csrf} section={section}><div className="ops-card">No such error group.</div></Shell>;
       const events = await listErrorEvents(ops.pool, path[1], 50);
-      return <Shell csrf={csrf}><ErrorDetail group={group} events={events} csrf={csrf} replayProjectUrl={ops.config.openReplay?.projectUrl} /></Shell>;
+      return <Shell csrf={csrf} section={section}><ErrorDetail group={group} events={events} csrf={csrf} replayProjectUrl={ops.config.openReplay?.projectUrl} /></Shell>;
     }
 
     const unresolved = one(search.unresolved) === "1";
@@ -162,7 +165,7 @@ export async function OpsView({ ops, path, search, cookieHeader }: OpsViewProps)
       userId,
     });
     return (
-      <Shell csrf={csrf}>
+      <Shell csrf={csrf} section={section}>
         <Errors groups={groups} unresolved={unresolved} since24h={since24h} source={source} userId={userId} />
       </Shell>
     );
@@ -170,7 +173,7 @@ export async function OpsView({ ops, path, search, cookieHeader }: OpsViewProps)
 
   if (path[0] === "users" && path[1]) {
     const user = await store.get(path[1]);
-    if (!user) return <Shell csrf={csrf}><div className="ops-card">No such user.</div></Shell>;
+    if (!user) return <Shell csrf={csrf} section={section}><div className="ops-card">No such user.</div></Shell>;
 
     // Signature-checked, never JSON.parse: an unsigned flash cookie could be
     // planted by a sibling subdomain to show the operator a sign-in link of the
@@ -181,7 +184,7 @@ export async function OpsView({ ops, path, search, cookieHeader }: OpsViewProps)
     if (flash && flash.user === user.id) reveal = { kind: flash.kind, value: flash.value };
 
     return (
-      <Shell csrf={csrf}>
+      <Shell csrf={csrf} section={section}>
         <UserDetail
           user={user}
           roles={store.roles}
@@ -200,8 +203,9 @@ export async function OpsView({ ops, path, search, cookieHeader }: OpsViewProps)
     includeDisabled: one(search.disabled) === "1",
   });
   return (
-    <Shell csrf={csrf}>
-      <Users users={users} total={total} query={query} roles={store.roles} csrf={csrf} />
+    <Shell csrf={csrf} section={section}>
+      <Users users={users} total={total} query={query} roles={store.roles} csrf={csrf}
+        includeDisabled={one(search.disabled) === "1"} allowLoginLink={Boolean(ops.config.loginLink)} />
     </Shell>
   );
 }

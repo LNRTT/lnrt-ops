@@ -222,6 +222,62 @@ function redirect(to: string, extra: Record<string, string | string[]> = {}): Re
   return respond(303, null, { Location: to, ...extra });
 }
 
+function escapeHtml(value: string): string {
+  return value.replace(/[&<>"']/g, (char) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  })[char]!);
+}
+
+/** Native form failures are readable documents, including under `nosniff`. */
+function actionError(
+  req: Request, status: number, message: string, backTo: string,
+  extra: Record<string, string | string[]> = {},
+): Response {
+  const accept = req.headers.get("accept") ?? "";
+  const acceptsHtml = accept.split(",").some((part) => {
+    const [type, ...parameters] = part.trim().toLowerCase().split(";");
+    return type === "text/html" && !parameters.some((parameter) => /^q\s*=\s*0(?:\.0*)?$/.test(parameter.trim()));
+  });
+  const document = req.headers.get("sec-fetch-dest") === "document" ||
+    req.headers.get("sec-fetch-mode") === "navigate";
+  const headers = { ...extra, Vary: "Accept, Sec-Fetch-Dest, Sec-Fetch-Mode" };
+  if (!document && !acceptsHtml) {
+    return respond(status, message, { ...headers, "Content-Type": "text/plain; charset=utf-8" });
+  }
+  const title = status === 500 ? "Action needs attention" : "Action could not be completed";
+  return respond(status, `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><meta name="robots" content="noindex, nofollow"><title>${title} · Operations</title></head><body><main><h1>${title}</h1><p role="alert">${escapeHtml(message)}</p><p><a href="${escapeHtml(backTo)}">Back to Operations</a></p></main></body></html>`, {
+    ...headers,
+    "Content-Type": "text/html; charset=utf-8",
+    "Content-Disposition": "inline",
+    "X-Content-Type-Options": "nosniff",
+  });
+}
+
+/** Resolve before minting: invalid proxy/config data must not consume a token. */
+function loginLinkBase(req: Request, config: NonNullable<OpsInstance["config"]["loginLink"]>): URL {
+  if (config.origin) return new URL(config.path, config.origin);
+  const requestUrl = new URL(req.url);
+  const host = (req.headers.get("x-forwarded-host")?.split(",")[0] ??
+    req.headers.get("host") ?? requestUrl.host).trim();
+  const protocol = (req.headers.get("x-forwarded-proto")?.split(",")[0] ??
+    requestUrl.protocol.slice(0, -1)).trim().toLowerCase();
+  // A host header is an authority, never a URL, credentials, path or query.
+  if (!host || /[\s/@\\?#\u0000-\u001f\u007f]/.test(host) || !["http", "https"].includes(protocol)) {
+    throw new Error("Invalid public application origin.");
+  }
+  const origin = new URL(`${protocol}://${host}`);
+  if (!origin.hostname || origin.username || origin.password || origin.pathname !== "/") {
+    throw new Error("Invalid public application origin.");
+  }
+  return new URL(config.path, origin);
+}
+
+function absoluteLoginLink(base: URL, token: string): string {
+  if (!token || token === "." || token === "..") throw new Error("Invalid sign-in token.");
+  base.pathname = `${base.pathname.replace(/\/+$/, "")}/${encodeURIComponent(token)}`;
+  return base.href;
+}
+
 // --- CSRF -------------------------------------------------------------
 //
 // SameSite=Strict blocks cross-*site* POSTs, but "same site" is registrable-
@@ -511,13 +567,19 @@ export function createHandlers(ops: OpsInstance) {
     if (path === "ingest") return handleIngest(req);
 
     const body = new URLSearchParams(await req.text());
+    const id = body.get("id") ?? "";
+    const backTo = path.startsWith("users/")
+      ? `${base}/users${id ? `/${encodeURIComponent(id)}` : ""}`
+      : path === "errors/status" && id ? `${base}/errors/${encodeURIComponent(id)}` : base;
+    const fail = (status: number, message = "", extra: Record<string, string | string[]> = {}) =>
+      actionError(req, status, message, backTo, extra);
 
     if (path === "login") {
       await ops.ready();
       const ip = clientIp(req);
       const gate = loginLimiter.check(ip);
       if (!gate.ok) {
-        return respond(429, "Too many attempts.", { "Retry-After": String(Math.ceil(gate.retryAfterMs / 1000)) });
+        return fail(429, "Too many attempts.", { "Retry-After": String(Math.ceil(gate.retryAfterMs / 1000)) });
       }
       const email = (body.get("email") ?? "").trim();
       const password = body.get("password") ?? "";
@@ -540,26 +602,25 @@ export function createHandlers(ops: OpsInstance) {
         await audit(req, email || "unknown", "gate.login.failed", "Rejected sign-in attempt");
         return redirect(`${base}?error=invalid`);
       } catch (err) {
-        if (err instanceof AppliedButNotRecorded) return respond(500, err.message, err.extraHeaders);
-        return respond(500, "The action failed. Nothing was changed.");
+        if (err instanceof AppliedButNotRecorded) return fail(500, err.message, err.extraHeaders);
+        return fail(500, "The action failed. Nothing was changed.");
       }
     }
 
     const s = await session(req);
-    if (!s) return respond(401, "Not signed in.");
+    if (!s) return fail(401, "Not signed in.");
 
-    if (!AUTHENTICATED_PATHS.has(path)) return respond(404);
+    if (!AUTHENTICATED_PATHS.has(path)) return fail(404);
 
     const supplied = body.get("csrf") ?? "";
     const expected = csrfToken(s.email, process.env.OPS_SECRET!);
     if (!timingSafeStringEqual(supplied, expected)) {
-      return respond(403, "Invalid or missing CSRF token.");
+      return fail(403, "Invalid or missing CSRF token.");
     }
 
     await ops.ready();
 
     const store = ops.config.users;
-    const id = body.get("id") ?? "";
 
     try {
       switch (path) {
@@ -581,30 +642,43 @@ export function createHandlers(ops: OpsInstance) {
           const email = (body.get("email") ?? "").trim();
           const name = (body.get("name") ?? "").trim();
           const role = body.get("role") ?? "";
-          if (!email || !name) return respond(400, "Email and name are required.");
-          if (!store.roles.includes(role)) return respond(400, "Unknown role.");
+          if (!email || !name) return fail(400, "Email and name are required.");
+          if (!store.roles.includes(role)) return fail(400, "Unknown role.");
+          const linkBase = ops.config.loginLink ? loginLinkBase(req, ops.config.loginLink) : undefined;
           const user = await store.create({ email, name, role });
+          const detailUrl = `${base}/users/${encodeURIComponent(user.id)}`;
           // Unlike the password/login-link reveals below, a lost audit write
           // here is recoverable without extraHeaders: the user row exists,
           // an operator can find it and mint a fresh login link at any time.
           await auditApplied(req, s.email, "user.create", `Created ${email} as ${role}`, user.id);
           if (ops.config.loginLink) {
-            const token = await ops.config.loginLink.mint(user.id);
-            return redirect(`${base}/users/${user.id}`, {
-              "Set-Cookie": flashCookie(req, { kind: "link", user: user.id, value: `${ops.config.loginLink.path}/${token}` }),
-            });
+            try {
+              const token = await ops.config.loginLink.mint(user.id);
+              return redirect(detailUrl, {
+                "Set-Cookie": flashCookie(req, { kind: "link", user: user.id, value: absoluteLoginLink(linkBase!, token) }),
+              });
+            } catch {
+              return actionError(req, 500,
+                "User was created, but the sign-in link could not be created. Open the user details to create a new sign-in link; do not create the user again.",
+                detailUrl);
+            }
           }
-          return redirect(`${base}/users/${user.id}`);
+          return redirect(detailUrl);
         }
 
         case "users/password": {
-          if (!(await store.get(id))) return respond(404, "No such user.");
-          const explicit = body.get("password")?.trim() || undefined;
+          if (!(await store.get(id))) return fail(404, "No such user.");
+          const explicit = body.get("password") || undefined;
           let plaintext: string;
           try {
             plaintext = await resetPassword(store, id, explicit);
-          } catch (err) {
-            return respond(400, err instanceof Error ? err.message : "Invalid password.");
+          } catch {
+            // Adapter errors can contain SQL parameters, including the password.
+            // Only the package's known validation error is safe to reveal.
+            if (explicit !== undefined && explicit.length < 12) {
+              return fail(400, "Password must be at least 12 characters.");
+            }
+            return fail(500, "The password could not be updated. Check the user details before retrying.");
           }
           const flash = flashCookie(req, { kind: "password", user: id, value: plaintext });
           // The whole point: if the audit write fails, the operator must
@@ -615,8 +689,8 @@ export function createHandlers(ops: OpsInstance) {
 
         case "users/role": {
           const role = body.get("role") ?? "";
-          if (!store.roles.includes(role)) return respond(400, "Unknown role.");
-          if (!(await store.get(id))) return respond(404, "No such user.");
+          if (!store.roles.includes(role)) return fail(400, "Unknown role.");
+          if (!(await store.get(id))) return fail(404, "No such user.");
           await store.setRole(id, role);
           await auditApplied(req, s.email, "user.role", `Changed role to ${role}`, id);
           return redirect(`${base}/users/${id}`);
@@ -625,10 +699,10 @@ export function createHandlers(ops: OpsInstance) {
         case "users/disable": {
           const raw = body.get("disabled");
           if (raw !== "1" && raw !== "0") {
-            return respond(400, 'The "disabled" field must be exactly "1" or "0".');
+            return fail(400, 'The "disabled" field must be exactly "1" or "0".');
           }
           const disabled = raw === "1";
-          if (!(await store.get(id))) return respond(404, "No such user.");
+          if (!(await store.get(id))) return fail(404, "No such user.");
           await store.setDisabled(id, disabled);
           await auditApplied(
             req, s.email, "user.disable", disabled ? "Disabled the account" : "Restored the account", id,
@@ -637,13 +711,13 @@ export function createHandlers(ops: OpsInstance) {
         }
 
         case "users/delete": {
-          if (!canHardDelete(store)) return respond(400, "This project does not support hard deletion.");
+          if (!canHardDelete(store)) return fail(400, "This project does not support hard deletion.");
           const user = await store.get(id);
-          if (!user) return respond(404, "No such user.");
+          if (!user) return fail(404, "No such user.");
           if (body.get("confirm")?.trim().toLowerCase() !== user.email.toLowerCase()) {
             // A refused delete on the most destructive route still leaves a trace.
             await audit(req, s.email, "user.delete.refused", `Refused to delete ${user.email}: confirmation mismatch`, id);
-            return respond(400, "Type the user's email address to confirm.");
+            return fail(400, "Type the user's email address to confirm.");
           }
           // Irreversible: audit the intent before the call, so a failure in
           // hardDelete (or in the completion audit below) still leaves a
@@ -655,10 +729,11 @@ export function createHandlers(ops: OpsInstance) {
         }
 
         case "users/login-link": {
-          if (!ops.config.loginLink) return respond(400, "This project has no login-link support.");
-          if (!(await store.get(id))) return respond(404, "No such user.");
+          if (!ops.config.loginLink) return fail(400, "This project has no login-link support.");
+          if (!(await store.get(id))) return fail(404, "No such user.");
+          const linkBase = loginLinkBase(req, ops.config.loginLink);
           const token = await ops.config.loginLink.mint(id);
-          const flash = flashCookie(req, { kind: "link", user: id, value: `${ops.config.loginLink.path}/${token}` });
+          const flash = flashCookie(req, { kind: "link", user: id, value: absoluteLoginLink(linkBase, token) });
           await auditApplied(req, s.email, "user.login-link", "Minted a sign-in link", id, { "Set-Cookie": flash });
           return redirect(`${base}/users/${id}`, { "Set-Cookie": flash });
         }
@@ -666,9 +741,9 @@ export function createHandlers(ops: OpsInstance) {
         case "errors/status": {
           const raw = body.get("status");
           if (raw !== "resolved" && raw !== "ignored") {
-            return respond(400, 'The "status" field must be exactly "resolved" or "ignored".');
+            return fail(400, 'The "status" field must be exactly "resolved" or "ignored".');
           }
-          if (!(await getErrorGroup(ops.pool, id))) return respond(404, "No such error group.");
+          if (!(await getErrorGroup(ops.pool, id))) return fail(404, "No such error group.");
           await setErrorGroupStatus(ops.pool, id, raw);
           // The group id is a fingerprint hash, not attacker-supplied text --
           // unlike its type/message/stack, it is safe to write straight into
@@ -679,11 +754,11 @@ export function createHandlers(ops: OpsInstance) {
         }
 
         default:
-          return respond(404);
+          return fail(404);
       }
     } catch (err) {
-      if (err instanceof AppliedButNotRecorded) return respond(500, err.message, err.extraHeaders);
-      return respond(500, "The action failed. Nothing was changed.");
+      if (err instanceof AppliedButNotRecorded) return fail(500, err.message, err.extraHeaders);
+      return fail(500, "The action failed. Nothing was changed.");
     }
   }
 

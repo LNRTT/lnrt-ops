@@ -12,8 +12,19 @@ export type OpsConfig = {
   /** Optional dashboard project URL, e.g. https://replay.example.com/42. */
   openReplay?: { projectUrl: string };
   users: OpsUserStore;
-  /** Mints a one-time sign-in token; the link becomes `${path}/${token}`. */
-  loginLink?: { mint(userId: string): Promise<string>; path: string };
+  /** Mints a one-time token, appended as an encoded path segment to an absolute sign-in URL. */
+  loginLink?: {
+    mint(userId: string): Promise<string>;
+    /** Application-relative route, e.g. /invite. */
+    path: string;
+    /**
+     * Optional public HTTP(S) origin, e.g. https://app.example.com. Otherwise
+     * the current request's host and protocol are used, including forwarded
+     * headers. In that case the reverse proxy must overwrite those headers.
+     * Configure this separately in preview and production when pinning it.
+     */
+    origin?: string;
+  };
   /** Environment variable names the health page should require. */
   requiredEnv?: string[];
   /** Extra project-specific checks, appended after the built-ins. */
@@ -49,6 +60,22 @@ export type OpsInstance = {
 };
 
 export function defineOps(config: OpsConfig): OpsInstance {
+  if (config.loginLink) {
+    const { path, origin } = config.loginLink;
+    if (!path.startsWith("/") || path.startsWith("//") || /[\\?#\s\u0000-\u001f\u007f]/.test(path)) {
+      throw new Error("loginLink.path must be an application-relative path without a query or fragment.");
+    }
+    if (origin !== undefined) {
+      let url: URL;
+      try { url = new URL(origin); } catch {
+        throw new Error("loginLink.origin must be a public HTTP(S) origin.");
+      }
+      if (!/^https?:\/\/[^/\\?#\s]+\/?$/i.test(origin) || !url.hostname || url.username || url.password ||
+          url.pathname !== "/" || url.search || url.hash || origin !== origin.trim()) {
+        throw new Error("loginLink.origin must be a public HTTP(S) origin.");
+      }
+    }
+  }
   const pool = getPool(config.db.connectionString);
   let readyPromise: Promise<void> | null = null;
 

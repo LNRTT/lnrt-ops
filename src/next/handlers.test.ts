@@ -18,6 +18,7 @@ const DB_URL = await createTestDatabase("handlers");
 const SECRET = "a-secret-at-least-32-characters-long!!";
 
 let rows: OpsUser[];
+let passwordWrites: string[];
 const store: OpsUserStore = {
   roles: ["WORKER", "ADMIN"],
   async list() { return { users: rows, total: rows.length }; },
@@ -26,7 +27,7 @@ const store: OpsUserStore = {
     const u = { id: "u2", ...input, disabled: false, hasPassword: false };
     rows.push(u); return u;
   },
-  async setPassword(id) { const u = rows.find((r) => r.id === id)!; u.hasPassword = true; },
+  async setPassword(id, password) { passwordWrites.push(password); const u = rows.find((r) => r.id === id)!; u.hasPassword = true; },
   async setRole(id, role) { rows.find((r) => r.id === id)!.role = role; },
   async setDisabled(id, d) { rows.find((r) => r.id === id)!.disabled = d; },
 };
@@ -224,6 +225,7 @@ after(async () => {
   await ops2.pool.end();
 });
 beforeEach(() => {
+  passwordWrites = [];
   rows = [{ id: "u1", email: "a@b.cz", name: "Anna", role: "WORKER", disabled: false, hasPassword: true }];
   deletableRows = [{ id: "u1", email: "a@b.cz", name: "Anna", role: "WORKER", disabled: false, hasPassword: true }];
   rows2 = [{ id: "u1", email: "a@b.cz", name: "Anna", role: "WORKER", disabled: false, hasPassword: true }];
@@ -367,6 +369,103 @@ test("users/password 400s for a too-short explicit password, with no write", asy
   const res = await POST(form("users/password", { id: "u1", password: "short" }, authCookie));
   assert.equal(res.status, 400);
   assert.equal(rows[0]!.hasPassword, true);
+  assert.equal(passwordWrites.length, 0);
+});
+
+test("a browser password validation failure is an inline HTML page with a safe way back", async () => {
+  const res = await POST(form("users/password", { id: "u1", password: "short" }, authCookie, undefined, {
+    accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "sec-fetch-dest": "document",
+    "sec-fetch-mode": "navigate",
+  }));
+  assert.equal(res.status, 400);
+  assert.equal(res.headers.get("content-type"), "text/html; charset=utf-8");
+  assert.equal(res.headers.get("content-disposition"), "inline");
+  assert.equal(res.headers.get("x-content-type-options"), "nosniff");
+  assert.equal(res.headers.get("cache-control"), "no-store");
+  assert.equal(res.headers.get("set-cookie"), null);
+  const html = await res.text();
+  assert.match(html, /^<!doctype html>/);
+  assert.match(html, /Password must be at least 12 characters/);
+  assert.match(html, /href="\/ops\/users\/u1"/);
+  assert.equal(passwordWrites.length, 0);
+});
+
+test("browser navigation without Accept still receives HTML, while ordinary fetch stays text", async () => {
+  for (const headers of [{ "sec-fetch-mode": "navigate" }, { "sec-fetch-dest": "document" }] as Record<string, string>[]) {
+    const res = await POST(form("users/password", { id: "u1", password: "short" }, authCookie, undefined, headers));
+    assert.equal(res.status, 400);
+    assert.match(res.headers.get("content-type")!, /^text\/html/);
+  }
+  for (const headers of [{}, { accept: "*/*" }, { accept: "text/html;q=0, text/plain" }, { accept: "application/json" }] as Record<string, string>[]) {
+    const res = await POST(form("users/password", { id: "u1", password: "short" }, authCookie, undefined, headers));
+    assert.equal(res.status, 400);
+    assert.match(res.headers.get("content-type")!, /^text\/plain/);
+    assert.equal(await res.text(), "Password must be at least 12 characters.");
+  }
+  assert.equal(passwordWrites.length, 0);
+});
+
+test("manual password success keeps PRG and reveals exactly the applied password without leaking it", async () => {
+  const password = "a-new-private-password";
+  const res = await POST(form("users/password", { id: "u1", password }, authCookie, undefined, { accept: "text/html" }));
+  assert.equal(res.status, 303);
+  assert.equal(res.headers.get("location"), "/ops/users/u1");
+  assert.deepEqual(passwordWrites, [password]);
+  assert.equal(extractFlash(res)?.value, password);
+  assert.equal(await res.text(), "");
+  assert.match(res.headers.get("set-cookie")!, /HttpOnly/);
+  assert.match(res.headers.get("set-cookie")!, /Max-Age=60/);
+  assert.equal(JSON.stringify(await listAudit(ops.pool, { limit: 10 })).includes(password), false);
+});
+
+test("explicit passwords retain leading, trailing and all-whitespace characters exactly", async () => {
+  for (const password of ["  padded-private-password  ", " ".repeat(12)]) {
+    const res = await POST(form("users/password", { id: "u1", password }, authCookie));
+    assert.equal(res.status, 303);
+    assert.equal(passwordWrites.at(-1), password);
+    assert.equal(extractFlash(res)?.value, password);
+    assert.equal(res.headers.get("location"), "/ops/users/u1");
+  }
+  assert.equal(passwordWrites.length, 2);
+});
+
+test("only an absent or empty password requests a generated password", async () => {
+  for (const fields of [{ id: "u1" }, { id: "u1", password: "" }] as Record<string, string>[]) {
+    const res = await POST(form("users/password", fields, authCookie));
+    assert.equal(res.status, 303);
+    const generated = passwordWrites.at(-1)!;
+    assert.match(generated, /^[A-Za-z0-9]{20}$/);
+    assert.equal(extractFlash(res)?.value, generated);
+  }
+  assert.equal(passwordWrites.length, 2);
+});
+
+test("password adapter exceptions cannot expose plaintext or database details in HTML errors", async () => {
+  const password = "private-password-do-not-render";
+  const failing = createHandlers({ ...ops, config: { ...ops.config, users: {
+    ...store, async setPassword() { throw new Error(`UPDATE users password=${password}`); },
+  } } });
+  const res = await failing.POST(form("users/password", { id: "u1", password }, authCookie, undefined, { accept: "text/html" }));
+  assert.equal(res.status, 500);
+  const html = await res.text();
+  assert.equal(html.includes(password), false);
+  assert.equal(html.includes("UPDATE users"), false);
+  assert.match(html, /password could not be updated/);
+  assert.equal(res.headers.get("set-cookie"), null);
+});
+
+test("HTML failures preserve authentication and CSRF checks and escape hostile return paths", async () => {
+  const anon = await POST(form("users/password", { id: "u1" }, undefined, undefined, { accept: "text/html" }));
+  assert.equal(anon.status, 401);
+  const badCsrf = await POST(form("users/password", {
+    id: 'u1"><script>alert(1)</script>', csrf: "wrong",
+  }, authCookie, undefined, { accept: "text/html" }));
+  assert.equal(badCsrf.status, 403);
+  const html = await badCsrf.text();
+  assert.equal(html.includes("<script>"), false);
+  assert.match(html, /href="\/ops\/users\/u1%22%3E%3Cscript/);
+  assert.equal(passwordWrites.length, 0);
 });
 
 test("an unknown role is rejected", async () => {
@@ -419,7 +518,100 @@ test("users/login-link happy path reveals the minted link in the flash cookie", 
   assert.ok(flash, "a correctly signed flash cookie must be set");
   assert.equal(flash!.kind, "link");
   assert.equal(flash!.user, "u1");
-  assert.equal(flash!.value, "/invite/TOKEN123");
+  assert.equal(flash!.value, "https://app.test/invite/TOKEN123");
+});
+
+test("created users also receive an absolute sign-in link", async () => {
+  const res = await POST(form("users/create", { email: "new@example.com", name: "New", role: "WORKER" }, authCookie));
+  assert.equal(res.status, 303);
+  assert.equal(extractFlash(res)?.value, "https://app.test/invite/TOKEN123");
+});
+
+for (const failure of ["mint throws", "invalid token"] as const) {
+  test(`user creation reports partial success with the new user's detail link when ${failure}`, async () => {
+    const { POST: post } = createHandlers({ ...ops, config: { ...ops.config,
+      loginLink: { path: "/invite", mint: async () => {
+        if (failure === "mint throws") throw new Error("adapter-secret-must-not-be-rendered");
+        return ".";
+      } },
+    } });
+    const res = await post(form("users/create", {
+      id: "u1", email: "partial@example.com", name: "Partial", role: "WORKER",
+    }, authCookie, undefined, { accept: "text/html" }));
+    assert.equal(res.status, 500);
+    assert.equal(rows.length, 2);
+    assert.equal(rows[1]!.email, "partial@example.com");
+    assert.equal(res.headers.get("content-disposition"), "inline");
+    assert.equal(res.headers.get("set-cookie"), null);
+    const html = await res.text();
+    assert.match(html, /User was created, but the sign-in link could not be created/);
+    assert.match(html, /href="\/ops\/users\/u2"/);
+    assert.equal(html.includes("Nothing was changed"), false);
+    assert.equal(html.includes("adapter-secret-must-not-be-rendered"), false);
+    const audit = await listAudit(ops.pool, { limit: 1 });
+    assert.equal(audit[0]!.action, "user.create");
+    assert.equal(audit[0]!.targetId, "u2");
+  });
+}
+
+test("sign-in links use each deployment's public forwarded host and protocol, never its internal URL", async () => {
+  for (const publicHost of ["dochazka.lnrt.cz", "dochazka-preview.lnrtdev.cz", "preview.example.com:8443"]) {
+    const template = form("users/login-link", { id: "u1" }, authCookie, undefined, {
+      host: "localhost:3000",
+      "x-forwarded-host": `${publicHost}, internal:3000`,
+      "x-forwarded-proto": "https, http",
+    });
+    const req = new Request("http://localhost:3000/ops/api/users/login-link", {
+      method: "POST", headers: template.headers, body: await template.text(),
+    });
+    const res = await POST(req);
+    assert.equal(res.status, 303);
+    assert.equal(extractFlash(res)?.value, `https://${publicHost}/invite/TOKEN123`);
+    assert.equal(res.headers.get("location"), "/ops/users/u1");
+  }
+});
+
+test("sign-in links fall back to Host, retain local HTTP and encode the token as one segment", async () => {
+  const { POST: post } = createHandlers({ ...ops, config: { ...ops.config,
+    loginLink: { path: "/invite/", mint: async () => "one/two?three#four" },
+  } });
+  const template = form("users/login-link", { id: "u1" }, authCookie, undefined, { host: "localhost:3055" });
+  const req = new Request("http://127.0.0.1:3000/ops/api/users/login-link", {
+    method: "POST", headers: template.headers, body: await template.text(),
+  });
+  const res = await post(req);
+  assert.equal(res.status, 303);
+  assert.equal(extractFlash(res)?.value, "http://localhost:3055/invite/one%2Ftwo%3Fthree%23four");
+});
+
+test("an explicitly configured public origin overrides forwarding headers", async () => {
+  const { POST: post } = createHandlers({ ...ops, config: { ...ops.config,
+    loginLink: { ...ops.config.loginLink!, origin: "https://trusted.example.com/" },
+  } });
+  const res = await post(form("users/login-link", { id: "u1" }, authCookie, undefined, {
+    "x-forwarded-host": "other.example.com", "x-forwarded-proto": "http", origin: "https://other.example.com",
+  }));
+  assert.equal(res.status, 303);
+  assert.equal(extractFlash(res)?.value, "https://trusted.example.com/invite/TOKEN123");
+});
+
+test("malformed forwarding headers fail before creating a user or minting a token", async () => {
+  let minted = 0;
+  const { POST: post } = createHandlers({ ...ops, config: { ...ops.config,
+    loginLink: { path: "/invite", mint: async () => { minted++; return "secret"; } },
+  } });
+  for (const headers of [
+    { "x-forwarded-host": "evil.example/path" }, { "x-forwarded-host": "user@evil.example" },
+    { "x-forwarded-host": "good.example\\evil" }, { "x-forwarded-proto": "javascript" },
+  ] as Record<string, string>[]) {
+    for (const action of ["users/login-link", "users/create"]) {
+      const res = await post(form(action, { id: "u1", name: "New", email: "new@example.com", role: "WORKER" }, authCookie, undefined, headers));
+      assert.equal(res.status, 500);
+      assert.equal(res.headers.get("set-cookie"), null);
+    }
+  }
+  assert.equal(minted, 0);
+  assert.equal(rows.length, 1);
 });
 
 test("users/login-link 400s when the host has no login-link support", async () => {
@@ -493,6 +685,16 @@ test("an audit failure after a successful password reset still returns the flash
   assert.equal(flash!.kind, "password");
   assert.equal(flash!.user, "u1");
   assert.match(flash!.value, /^[A-Za-z0-9]{12,}$/);
+
+  const browser = await POST2(form("users/password", { id: "u1" }, authCookie, undefined, { accept: "text/html" }));
+  assert.equal(browser.status, 500);
+  assert.equal(browser.headers.get("content-disposition"), "inline");
+  const html = await browser.text();
+  assert.match(html, /The change was applied/);
+  assert.match(html, /href="\/ops\/users\/u1"/);
+  const reveal = extractFlash(browser);
+  assert.equal(reveal?.kind, "password");
+  assert.equal(html.includes(reveal!.value), false, "the password stays in the authenticated reveal flow");
 });
 
 // --- POST /ops/api/errors/status ------------------------------------------
