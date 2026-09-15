@@ -69,6 +69,13 @@ export const ops = defineOps({
 });
 ```
 
+Sign-in links include the current application's origin and can be copied from
+the user detail page. Behind a reverse proxy, ensure it overwrites
+`X-Forwarded-Host` and `X-Forwarded-Proto`, or set `loginLink.origin` explicitly
+(for example `https://app.example.com`). Use the preview origin in preview.
+Password resets confirm success on the detail page; an empty password field
+generates a password, while a supplied value is preserved exactly.
+
 **2. The page** (`src/app/ops/[[...path]]/page.tsx`):
 
 ```tsx

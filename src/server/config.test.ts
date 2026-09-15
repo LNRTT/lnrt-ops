@@ -22,6 +22,30 @@ const users: OpsUserStore = {
 const ops = defineOps({ db: { connectionString: URL }, users });
 after(async () => { await ops.pool.end(); });
 
+test("login links accept a relative route and an optional public origin", () => {
+  for (const origin of [undefined, "https://dochazka.lnrt.cz", "https://dochazka-preview.lnrtdev.cz/", "http://localhost:3055"]) {
+    assert.doesNotThrow(() => defineOps({
+      db: { connectionString: URL }, users,
+      loginLink: { path: "/invite/", origin, mint: async () => "unused" },
+    }));
+  }
+});
+
+test("login-link configuration rejects non-application paths and unsafe origins before any mutation", () => {
+  for (const path of ["invite", "https://other.example/invite", "//other.example/invite", "/\\other.example", "/invite?x=1", "/invite#fragment", "/in vite"]) {
+    assert.throws(() => defineOps({
+      db: { connectionString: URL }, users,
+      loginLink: { path, mint: async () => "unused" },
+    }), /loginLink.path/);
+  }
+  for (const origin of ["", "javascript:alert(1)", "https://user:password@example.com", "https://example.com/path", "https://example.com?query=1", "https://example.com#fragment", "https:///example.com", " https://example.com", "https://example.com\\path"]) {
+    assert.throws(() => defineOps({
+      db: { connectionString: URL }, users,
+      loginLink: { path: "/invite", origin, mint: async () => "unused" },
+    }), /loginLink.origin/);
+  }
+});
+
 test("ready() migrates and is safe to call repeatedly", async () => {
   await ops.ready();
   await ops.ready();

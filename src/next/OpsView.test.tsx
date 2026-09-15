@@ -431,3 +431,41 @@ test("other views degrade to a styled message instead of throwing when Postgres 
   assert.match(html, /operations database is unavailable/i);
   assert.match(html, /href="\/ops\/health"/);
 });
+
+
+test("users retains the disabled filter and marks the current navigation section", async () => {
+  const html = await render(["users"], authCookie, { q: "Anna", disabled: "1" });
+  assert.match(html, /name="disabled"[^>]*checked=""/);
+  assert.match(html, /href="\/ops\/users" aria-current="page"/);
+  assert.match(html, /value="Anna"/);
+  const detail = await render(["users", "u1"], authCookie);
+  assert.match(detail, /href="\/ops\/users" aria-current="page"/);
+});
+
+test("a verified password reveal confirms the update and can be copied without placing it in a link", async () => {
+  const password = "updated-password-for-ui-check";
+  const value = signFlash({ kind: "password", user: "u1", value: password }, SECRET);
+  const html = await render(["users", "u1"], `${authCookie}; lnrt_ops_flash=${encodeURIComponent(value)}`);
+  assert.match(html, /Password updated successfully\./);
+  assert.match(html, /<textarea[^>]*readonly=""[^>]*>updated-password-for-ui-check<\/textarea>/i);
+  assert.match(html, /type="button">Copy password<\/button>/);
+  assert.equal(/href="[^"]*updated-password-for-ui-check/.test(html), false);
+});
+
+test("a verified sign-in reveal exposes the full URL in a read-only field and copy button", async () => {
+  const url = "https://customer.example.test/invite/one-time-token";
+  const value = signFlash({ kind: "link", user: "u1", value: url }, SECRET);
+  const html = await render(["users", "u1"], `${authCookie}; lnrt_ops_flash=${encodeURIComponent(value)}`);
+  assert.match(html, /Sign-in link created\./);
+  assert.ok(html.includes(url));
+  assert.match(html, /type="button">Copy link<\/button>/);
+  assert.equal(html.includes(`href="${url}"`), false, "copying must not consume the sign-in link through navigation");
+});
+
+test("create-user instructions reflect whether the host supports sign-in links", async () => {
+  const withoutLinks = await render(["users"], authCookie);
+  assert.match(withoutLinks, /Set a password on the user/);
+  assert.equal(withoutLinks.includes("A one-time sign-in link is produced"), false);
+  const withLinks = await renderWith(opsWithExtras, ["users"], authCookie);
+  assert.match(withLinks, /A one-time sign-in link is produced/);
+});
